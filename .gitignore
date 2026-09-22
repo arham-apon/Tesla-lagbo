@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Dhaka Tesla Pool: JWT key pair (never commit private keys)
+keys/
