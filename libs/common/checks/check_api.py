@@ -10,7 +10,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from tesla_common.auth import ISSUER, InternalAuth, Principal, verify_jwt
 from tesla_common.errors import DomainError, install_error_handlers
@@ -33,6 +33,17 @@ class Body(BaseModel):
     seats: int
 
 
+class Trip(BaseModel):
+    pickup_zone: str
+    dropoff_zone: str
+
+    @model_validator(mode="after")
+    def _distinct(self):
+        if self.pickup_zone == self.dropoff_zone:
+            raise ValueError("pickup_zone and dropoff_zone must differ")
+        return self
+
+
 app = FastAPI()
 install_error_handlers(app)
 app.include_router(health_router({"db": ok_check}))
@@ -53,6 +64,11 @@ async def full():
     raise DomainError("POOL_FULL", "No seats left in Bullet", 409)
 
 
+@app.post("/trip")
+async def trip(body: Trip):
+    return body
+
+
 def main() -> None:
     c = TestClient(app)
     trusted = {"X-Internal-Token": TOKEN, "X-User-Id": "u-1", "X-User-Role": "DRIVER", "X-User-Name": "Jashim"}
@@ -67,10 +83,13 @@ def main() -> None:
     assert r.status_code == 403 and r.json()["error"]["code"] == "FORBIDDEN"
     r = c.post("/driver-only", json={"seats": "two"}, headers=trusted)
     assert r.status_code == 422 and r.json()["error"]["code"] == "VALIDATION_ERROR"
+    r = c.post("/trip", json={"pickup_zone": "BANANI", "dropoff_zone": "BANANI"})  # model_validator error
+    assert r.status_code == 422 and r.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert "must differ" in r.json()["error"]["details"][0]["msg"]
     r = c.get("/full", headers={"X-Request-Id": "req-42"})
     assert r.status_code == 409 and r.json()["error"] == {
         "code": "POOL_FULL", "message": "No seats left in Bullet", "request_id": "req-42", "details": None}
-    print("OK: auth deps (401/401/200/403), validation 422, DomainError 409 with request_id")
+    print("OK: auth deps (401/401/200/403), validation 422 (incl. model_validator), DomainError 409 with request_id")
 
     assert c.get("/health").json() == {"status": "ok", "checks": {"db": "ok"}}
     bad = FastAPI()

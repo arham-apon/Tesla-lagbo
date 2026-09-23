@@ -148,3 +148,11 @@ Run them yourself (PowerShell, from the project folder):
 - **RabbitMQ tip:** don't run `docker exec <rabbit> rabbitmq-diagnostics ...` as root while RabbitMQ is still starting. It creates a root-owned `.erlang.cookie` and RabbitMQ then crashes on boot. Use `docker exec -u rabbitmq ...`.
 - `.env` was copied from `.env.example`. It is gitignored, so change the passwords there.
 - `services/*` folders are empty on purpose. They get filled in the next parts.
+
+---
+
+## Later fixes to the library
+
+| When | File | Fix | Why |
+|---|---|---|---|
+| Part 4.6 | `errors.py` | the 422 handler now passes `exc.errors()` through `jsonable_encoder` (as FastAPI's own handler does) | When a `model_validator` rejects a request (e.g. "pickup and drop-off must differ"), pydantic puts the raw `ValueError` object into the error details. Plain JSON can't encode that, so **the error handler itself crashed** and the client got a 500 instead of a 422. `check_api.py` now includes this case (it fails on the old code and passes on the new). Details in `exp4.md`, 4.6. |

@@ -56,6 +56,13 @@ class EvaluateOut(BaseModel):
     candidate_drivers: list[CandidateDriver]
 
 
+class ZoneOut(BaseModel):
+    code: str
+    name: str
+    lat: float
+    lng: float
+
+
 class LocationPing(BaseModel):
     lat: float = Field(ge=23.60, le=23.95)
     lng: float = Field(ge=90.30, le=90.55)

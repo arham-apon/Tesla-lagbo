@@ -9,7 +9,7 @@
 | 4.3 | Data layer (zones, distances, schemas) | **Done** (explained below) |
 | 4.4 | Matching algorithm (the pool planner) | **Done** (explained below) |
 | 4.5 | Fleet state in Redis (where drivers are, who's free) | **Done** (explained below) |
-| 4.6 | API endpoints | Not started |
+| 4.6 | API endpoints | **Done** (explained below) |
 | 4.7 | Messaging integration | Not started |
 | 4.8 | Step-by-step build + tests | Not started |
 
@@ -526,6 +526,102 @@ With a fixed width, text order = time order everywhere. I haven't changed Part 1
 
 ---
 
+## 4.6: the API endpoints
+
+### The four endpoints
+
+The phone sees `/api/v1/...`; the gateway strips `/api/v1` and forwards (Part 2).
+
+| Method | Route | Who | Answer | Errors | File |
+|---|---|---|---|---|---|
+| GET | `/zones` | anyone (no login) | 200 `[{code, name, lat, lng}]`, 9 zones sorted by name | — | `routers/public.py` |
+| POST | `/driver/location` | DRIVER | **202** `{"zone": "BANANI"}` | 403 not a driver, 422 outside the Dhaka box | `routers/driver.py` |
+| GET | `/internal/zones/distance?from=&to=` | other services (Fare) | 200 `{"distance_m": 3500}` | 422 `UNKNOWN_ZONE` | `routers/internal.py` |
+| POST | `/internal/match/evaluate` | other services (Trip) | 200 `EvaluateOut` | 422 unknown zone / pickup = drop-off / bad seats | `routers/internal.py` |
+
+As with Identity, **every** route needs the `X-Internal-Token`, so it must have come through the gateway or from another service. "Anyone" means *no login*, not *reachable directly from the internet*.
+
+### `GET /zones`
+
+Returns the 9 zones for the app's pickup and drop-off pickers. Nothing is read from the database per request: the list is loaded **once at startup** into `app.state.zones`.
+
+**Small addition:** the plan says "from in-memory table", but the in-memory `DistanceTable` only holds codes and coordinates, **no names**. So `geo.py` got a second tiny loader, **`load_zones()`**, that the lifespan (4.8) will call next to `load_distance_table()`. It's sorted by name, so the app's list is alphabetical. There's also a `ZoneOut` schema, so the response shape is documented and checked.
+
+### `POST /driver/location`
+
+Jashim's phone sends `{lat, lng, heading?}` every few seconds. The endpoint:
+1. checks the role (**drivers only**; Nusrat gets 403),
+2. checks the point is inside the Dhaka box (4.3; 422 otherwise),
+3. calls `record_ping` (4.5): map, zone, heartbeat, and broadcast if he has passengers,
+4. answers **202 Accepted** with his zone.
+
+**Why 202, not 200:** the position is "accepted and on its way". There's nothing to read back and nothing the phone must wait for. It's also the one route with a **60/min** gateway limit (Part 2), which allows a ping every second.
+
+The ping time is written with **6 decimals always** (`isoformat(timespec="microseconds")`), so it never has the whole-second text problem from 4.5.
+
+### `GET /internal/zones/distance`
+
+Fare's question: "how far is Banani → Mohakhali?" → `{"distance_m": 3500}`. The parameter is called `from` in the URL, but `from` is a reserved word in Python, so the code names it `from_` with `alias="from"` (the plan's code).
+
+### `POST /internal/match/evaluate`: the heart of Part 4
+
+The plan's code, unchanged. For Trip's request it:
+1. works out the rider's **solo distance** (this also rejects unknown zones with 422),
+2. **ranks the open pools** Trip sent with the 140 % planner (4.4),
+3. **searches for free drivers** within `MATCH_RADIUS_M` (3 km) of the **pickup zone's centre**, nearest first, up to `max_candidates` (4.5),
+4. returns all three.
+
+It returns candidate drivers **even when a pool fits**. Trip decides: it prefers joining a pool (plan decision A5: auto-join) and uses the driver list only when no pool fits.
+
+**The Banani story through the real endpoints** (tested):
+
+| Moment | Trip asks | Matching answers |
+|---|---|---|
+| Nusrat, Banani → Mohakhali, no pools yet; Jashim online, ~50 m away | evaluate, `open_pools=[]` | solo **3500**, no pools, candidates **[Jashim]** |
+| Jashim accepted (pool `bullet-1` FORMING); Rafiq, Banani → Gulshan 1 | evaluate with Bullet's snapshot | solo **2000**, pool **bullet-1**, v1, **+500 m, 114 %**, plan B, B, G1, M; candidates **[]** (Jashim is busy) |
+| Shirin, 2 seats; Bullet has 1 left | evaluate with Bullet's snapshot | **no pools** |
+
+### A bug in Part 1, found by these tests (fixed)
+
+Testing "pickup = drop-off → 422" (the rule added in 4.4) returned a **500**. The cause was in **Part 1's `tesla_common/errors.py`**, the shared error handler every service uses:
+
+- When a `model_validator` rejects a request, pydantic puts the **actual `ValueError` object** into the error details (`ctx.error`).
+- Part 1's handler put those details straight into a JSON response. Python's JSON encoder can't encode an exception object, so **the error handler itself crashed** → 500.
+- Plain field errors (`seats: "two"`) have no such object, which is why Part 1's own checks and Identity's tests never hit it.
+
+**Who it affects:** any service with a `model_validator`, i.e. Matching now, and **Trip's `RideCreate`** in Part 5 (the same pickup ≠ drop-off rule). Without the fix, Nusrat choosing the same zone twice would get "server error" instead of a clear message.
+
+**Fix (one line + import):** pass the details through FastAPI's `jsonable_encoder`, exactly as FastAPI's own built-in handler does. The response is now a proper 422 with the message `"Value error, pickup_zone and dropoff_zone must differ"`.
+
+Because this is Part 1 code, I:
+- added this case to **`libs/common/checks/check_api.py`**. On the old `errors.py` it crashes (`TypeError: Object of type ValueError is not JSON serializable`); on the fixed one it passes;
+- re-ran **every** suite: Part 1 checks OK, gateway **65**, identity **94**, matching **109**, all passing;
+- noted the fix at the end of `exp1.md`.
+
+Unlike the timestamp change (4.5), this one wasn't optional: without it, a 4.6 endpoint returns 500 for a normal user mistake.
+
+### How 4.6 was checked: 20 new tests (109 in total), all passing
+
+The routers read everything from `request.app.state`, so the tests build a small app with `app.state` filled exactly as the lifespan will (zones + distance table from a migrated database, fakeredis). The real `main.py` comes in 4.8.
+
+| Endpoint | What's tested |
+|---|---|
+| `GET /zones` | 9 zones, Banani first with exact coordinates, sorted by name; works with **no user at all**; without the internal token → 401 |
+| `POST /driver/location` | 202 + `{"zone": "BANANI"}` and the state lands in Redis (with a 6-decimal time); **passenger → 403**; Chattogram / 0,0 → 422; no internal token → 401 |
+| `GET /internal/zones/distance` | Banani → Mohakhali = 3500; unknown zone → `UNKNOWN_ZONE`; missing `to` → 422; no token / wrong token → 401 |
+| `POST /internal/match/evaluate` | **the Banani story** (table above); a driver in Uttara isn't a candidate for Banani; `max_candidates=2` returns the 2 nearest; unknown zone / pickup = drop-off / 7 seats → 422; no token → 401 |
+
+**Break-it checks:**
+
+| Deliberately broke... | Result |
+|---|---|
+| `/zones` without the gateway check | 1 failed |
+| any logged-in user (not just drivers) may send pings | 1 failed |
+| search for drivers around the **drop-off** instead of the pickup | 1 failed |
+| ignore `max_candidates` | 1 failed |
+
+---
+
 ## Things to know before the next sections
 
 - **Build order:** the plan builds Matching **third** (after the common lib and Identity), because Fare and Trip both depend on it.
@@ -533,6 +629,7 @@ With a fixed width, text order = time order everywhere. I haven't changed Part 1
 - **Matching's "who is free" is eventually consistent** (a fraction of a second behind Identity and Trip). By design this is harmless, because Trip re-checks everything atomically when it books.
 - **Docker is still off**, but thanks to fakeredis's GEO support that won't block the Matching tests.
 - **Recommended before Part 5:** the one-line `emit()` change above (fixed-width timestamps), so Trip's consumer can't hit the whole-second bug.
+- **Part 1's `errors.py` was fixed in 4.6** (422s from `model_validator`s used to crash into 500s). All services use the fixed version automatically: `tesla_common` is installed in editable mode, and Docker copies `libs/common` fresh.
 - **`consumers.py` (4.7) must pass `occurred_at` to `on_pool_updated`** (its signature gained that argument in 4.5).
 - **Changing a CHECK rule needs a hand-written migration** (Alembic's autogenerate and `alembic check` don't see CHECK rules; found in 4.3).
 - **Fare will cache these distances for 24 h** (Part 6). If an override is ever changed, Fare's cache (`fare:dist:*` in Redis) must be cleared, or prices will use the old distance for up to a day.

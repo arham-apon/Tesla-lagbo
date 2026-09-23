@@ -52,3 +52,32 @@ async def dist(db):
     from app.geo import load_distance_table
     async with db.ro() as s:
         return await load_distance_table(s)
+
+
+@pytest.fixture
+async def api(db, dist, redis):
+    """The three routers on a test app with app.state filled the way the lifespan will (plan 4.8 step 5)."""
+    import httpx
+    from fastapi import FastAPI
+
+    from tesla_common.errors import install_error_handlers
+
+    from app.geo import load_zones
+    from app.routers import driver, internal, public
+
+    app = FastAPI()
+    install_error_handlers(app)
+    for module in (public, driver, internal):
+        app.include_router(module.router)
+    async with db.ro() as s:
+        app.state.zones = await load_zones(s)
+    app.state.dist, app.state.redis = dist, redis
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://matching") as c:
+        yield c
+
+
+GATEWAY = {"X-Internal-Token": INTERNAL_TOKEN}
+
+
+def as_user(user_id: str, role: str = "DRIVER") -> dict:
+    return GATEWAY | {"X-User-Id": user_id, "X-User-Role": role, "X-User-Name": user_id.title()}

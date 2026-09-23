@@ -5,7 +5,7 @@ now complete 2.1 of the  implementation plan.
 
 
 
-git add . && git commit -m "real time driver coordinates via redis" && git push
+git add . && git commit -m "endpoints for listing zones, recording driver location pings, and ranking compatible carpools for ride requests" && git push
 
 
 git branch trip-service

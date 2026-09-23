@@ -41,6 +41,12 @@ class DistanceTable:
         return min(self.zones, key=lambda c: haversine_m(lat, lng, *self.zones[c]))
 
 
+async def load_zones(session: AsyncSession) -> list[dict]:
+    """The zone list for GET /zones, sorted by name; kept in app.state.zones (the table has no names)."""
+    rows = (await session.execute(select(Zone).order_by(Zone.name))).scalars()
+    return [{"code": z.code, "name": z.name, "lat": z.lat, "lng": z.lng} for z in rows]
+
+
 async def load_distance_table(session: AsyncSession) -> DistanceTable:
     """Zones + overrides from matching.db; the lifespan keeps the result in app.state.dist (plan 4.8 step 5)."""
     zones = {z.code: (z.lat, z.lng) for z in (await session.execute(select(Zone))).scalars()}

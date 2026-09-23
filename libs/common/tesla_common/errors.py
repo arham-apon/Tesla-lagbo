@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -20,4 +21,7 @@ def install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(RequestValidationError)
     async def _validation(request: Request, exc: RequestValidationError):
-        return JSONResponse(_body("VALIDATION_ERROR", "Invalid request", request, exc.errors()), status_code=422)
+        # jsonable_encoder, as FastAPI's own handler does: a model_validator's error "ctx" holds the raw
+        # exception object, which plain JSON can't serialize (the handler itself would crash -> 500).
+        details = jsonable_encoder(exc.errors())
+        return JSONResponse(_body("VALIDATION_ERROR", "Invalid request", request, details), status_code=422)
