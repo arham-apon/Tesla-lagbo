@@ -2,3 +2,7 @@ now complete 2.1 of the  implementation plan.
  there is a docs folder, create a exp2.md file where you explain everything of part 2
  like you did with part 1.
   or now complete only 2.1 and update exp2.md
+
+
+
+git add . && git commit -m "ok" && git push
