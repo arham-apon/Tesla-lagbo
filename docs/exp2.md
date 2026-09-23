@@ -8,10 +8,15 @@
 | 2.2 | Directory structure | **Done** (explained below) |
 | 2.3 | Data layer | **Done** (explained below) |
 | 2.4 | Routing table & endpoints (the code) | **Done** (explained below) |
-| 2.5 | Messaging integration | Not started |
-| 2.6 | Step-by-step build + tests | Not started |
+| 2.5 | Messaging integration | **Done** (explained below) |
+| 2.6 | Step-by-step build + tests | **Done** (explained below) |
 
-This file grows as each section gets done.
+**Part 2 is complete.** The gateway is written and covered by 65 automated tests, all passing. Run them with:
+
+```
+cd services\gateway
+..\..\.venv\Scripts\python -m pytest
+```
 
 ---
 
@@ -444,6 +449,177 @@ I also installed **`fakeredis`** into `.venv` for the smoke test. 2.6's tests wi
 - **Gateway-made errors don't show the request id.** Errors like 401 or 429 are created by Part 1's error handler, which reads `request_id` from the *incoming* headers. If the client didn't send `X-Request-Id`, the body says `"request_id": null`. Replayed idempotent responses also don't carry `X-Request-Id`. A small middleware could fix both; worth doing later if request ids matter for support.
 - **Health failures for services show an empty reason** (`"trip": "fail: "`), because httpx connection errors have no message text. It's cosmetic; the name of the failing service is what matters.
 - **`/health` checks the 5 services one after another**, 2 s timeout each, so a fully broken system takes up to ~10 s to answer. Nothing in Compose waits on the gateway's health, so this is harmless.
+
+---
+
+## 2.5: messaging integration
+
+The plan says:
+
+> - **Produces:** none. **Consumes:** none.
+> - **Redis:** `INCR`+`EXPIRE` (`rl:*`), `SET NX EX` / `GET` / `DEL` (`idem:*`), `EXISTS` (`auth:revoked:*`).
+
+Like 2.1 and 2.3, this is a **rule to check, not code to write**. The gateway takes no part in the event system, and its Redis use is a fixed, short list.
+
+### Why the gateway sends and receives no events
+
+Every other service is connected to RabbitMQ (`tesla.events`). The gateway deliberately isn't:
+
+- **Nothing happens *in* the gateway that anyone needs to hear about.** Events report business facts, like "ride matched" or "fare settled". The gateway only decides "let this request through or not". The *result* of the request (a ride being created) is announced by the service that did it (Trip), through its outbox, in the same transaction as the database write (Part 1). If the gateway also published "ride requested", it could announce something that Trip then rejected.
+- **There's nothing it needs to react to.** It keeps no data about rides or drivers, so no event could change what it does. The one piece of shared state it needs (logged-out tokens) comes from Redis, which it reads on every request anyway.
+- **It keeps the front door simple.** No RabbitMQ connection means one less thing that can break the gateway, and no outbox, no consumer and no retry queues to run.
+
+How live updates reach the phones **without** the gateway:
+
+```
+Trip ──event──▶ RabbitMQ ──▶ Notification ──WebSocket :8005──▶ Nusrat's phone
+```
+
+The phone opens its WebSocket straight to Notification (Part 0.3), not through the gateway. So the gateway handles request → response only; pushed updates go the other way through Notification.
+
+### The complete list of Redis commands
+
+I searched every file in `services/gateway/app/` for Redis calls and for any RabbitMQ code (`aio_pika`, `tesla_common.events`, `Bus`). **No RabbitMQ code at all.** The Redis calls:
+
+| Command | Key | Where | In the 2.5 list? |
+|---|---|---|---|
+| `INCR` + `EXPIRE` (one pipeline, `MULTI`/`EXEC`) | `rl:*` | `ratelimit.enforce()` | ✅ |
+| `SET ... NX EX 120` | `idem:*` | `idempotency.begin()`: claim the key | ✅ |
+| `GET` | `idem:*` | `idempotency.begin()`: key already taken, read it | ✅ |
+| `SET ... EX 86400` (no `NX`) | `idem:*` | `idempotency.finish()`: store the `DONE` result | ✅ (in the plan's code, just not spelled out in the list) |
+| `DEL` | `idem:*` | `idempotency.finish()` on 5xx, and `main.proxy()` when the service is down | ✅ |
+| `EXISTS` | `auth:revoked:*` | `security.authenticate()` | ✅ |
+| `PING` | none | `/health` | ➕ added in 2.4 (health check) |
+
+So the gateway **writes** only to `rl:*` and `idem:*`, and only **reads** `auth:revoked:*`. It never touches another service's keys (`geo:*`, `driver:*`, `fare:dist:*`, ...) or Redis Pub/Sub.
+
+Per request that's at most **4 round trips to Redis** (`EXISTS`, the rate-limit pipeline, `SET NX`, then either `GET` for a repeat or the final `SET`/`DEL`). Each takes well under a millisecond on the same Docker network, so the gateway adds very little delay.
+
+### One thing to know for Part 8
+
+The plan's `docker-compose.yml` (Part 8) makes **every** service wait for RabbitMQ to be healthy, including the gateway (through the shared `x-service` settings). The gateway doesn't need RabbitMQ, so this only delays its start by a few seconds. It's harmless, and the gateway starts last anyway. `.env` also gives it `RABBITMQ_URL`, which it ignores (`Settings` only reads the variables it declares).
+
+### How 2.5 was checked
+
+- Searched the gateway's code for RabbitMQ use: **none**.
+- Listed every Redis call (table above). All match the 2.5 list, apart from the health-check `PING` added in 2.4.
+- The 2.4 smoke test already exercised every one of these commands (rate limit, idempotency claim/replay/delete, revoked token, health).
+
+---
+
+## 2.6: the step-by-step guide and the tests
+
+2.6 is the plan's build order for the gateway, with a test to write at each step. The *building* was done in 2.2 and 2.4. What 2.6 adds is **permanent, automated tests** that prove each step works and keep proving it every time the code changes.
+
+### The six steps, and where each one stands
+
+| Step | Plan says | Done in | Test file |
+|---|---|---|---|
+| 1 | `requirements.txt` + `uvicorn` | 2.2 | — |
+| 2 | `config.py`, `routes_table.py`; test that `/driver/location` → Matching and `/driver/offers` → Trip | 2.4 | `test_routes_table.py` |
+| 3 | `security.py`; test valid, expired, wrong issuer, revoked tokens | 2.4 | `test_security.py` |
+| 4 | `ratelimit.py`; test that the 11th login in a minute gets 429 | 2.4 | `test_ratelimit.py` |
+| 5 | `idempotency.py`; test replay, same key + different body → 422, 5xx → key deleted | 2.4 | `test_idempotency.py` |
+| 6 | `proxy.py`, `main.py`; confirm a client-sent `X-User-Id` is stripped | 2.4 | `test_proxy.py` |
+
+### What I added
+
+```
+services/gateway/
+├── pytest.ini              pytest settings (find app/, run async tests)
+├── requirements-dev.txt    test tools: pytest, pytest-asyncio, fakeredis
+└── tests/
+    ├── conftest.py         shared setup: test keys, fake Redis, fake services, token helpers
+    ├── test_routes_table.py   step 2  (21 tests)
+    ├── test_security.py       step 3  (11 tests)
+    ├── test_ratelimit.py      step 4  (5 tests)
+    ├── test_idempotency.py    step 5  (10 tests)
+    └── test_proxy.py          step 6  (18 tests)
+```
+
+The plan's other services put tests in `services/<name>/tests/` using pytest (for example `trip/tests/test_capacity.py`), so the gateway follows the same layout. In Part 1, the "checks" were one-off scripts. These are real tests: `pytest` finds and runs all of them in about 1.5 seconds.
+
+`.dockerignore` now also leaves out `tests/`, `pytest.ini` and `requirements-dev.txt`, so the Docker image contains no test code.
+
+### How the tests work without Docker
+
+The gateway talks to two things: **Redis** and **the five services**. The tests replace both with fakes:
+
+| Real thing | In the tests | Why |
+|---|---|---|
+| Redis | **fakeredis**, a Redis that lives in memory inside the test, fresh for every test | No Docker needed, and no test can leak counters or keys into the next one |
+| Identity, Matching, Trip, Fare, Notification | **`FakeUpstreams`**, a fake that answers every request and **records** it | Tests can check exactly what the gateway *sent* (headers, path, body), and can make a service "down" or "slow" on demand |
+| Identity's private key | a **throwaway RSA key pair** made when the tests start | Tests sign their own tokens (valid, expired, wrong issuer, wrong key...) |
+| The network | the gateway app is called **in-process** (httpx's `ASGITransport`) | Fast, with no ports (so no clash with the `mse-*` containers) |
+
+`conftest.py` provides these as pytest **fixtures**: ready-made objects a test just asks for by name. For example:
+
+```python
+async def test_client_sent_identity_headers_are_stripped(client, upstreams, auth_header):
+    #                                                    ↑ gateway  ↑ fake services  ↑ makes "Bearer <jwt>"
+```
+
+### What each test file proves
+
+**`test_routes_table.py` (step 2).** Tests `match()` directly, with no Redis and no HTTP.
+- The two cases the plan names: `/driver/location` → Matching, `/driver/offers` → Trip. Plus 11 more paths, one or more per service (`/driver/earnings` → Fare, `/drivers/me/online` → Identity, ...).
+- Near-misses **don't** match: `/api/v1/ridesXYZ`, `/api/v1/driverX`, `/api/v1`, `/rides`.
+- Only register, login and zones are public. Login is limited to 10/min, driver location to 60, everything else to 120. Login is public but **logout is not**.
+- The table really is sorted longest-first.
+
+**`test_security.py` (step 3).** Calls `authenticate()` directly.
+- The plan's four: a **valid** token → `Principal` + claims; **expired** → `TOKEN_EXPIRED`; **wrong issuer** → `INVALID_TOKEN`; **revoked** → `TOKEN_REVOKED`.
+- Extra: a token signed with **someone else's key** → `INVALID_TOKEN` (this is the important one: it proves only Identity can mint tokens). Garbage instead of a JWT → `INVALID_TOKEN`. No header, empty, `Basic ...` or `Token ...` → `UNAUTHENTICATED`. `bearer` in lowercase is accepted.
+
+**`test_ratelimit.py` (step 4).**
+- The plan's case: **10 logins → 200, the 11th → 429 `RATE_LIMITED`**, and Identity received only 10 requests.
+- **The clock is frozen** in these tests. Otherwise a test that happens to run across a minute boundary (e.g. 08:41:59.9 → 08:42:00.1) would see the counter reset and fail at random. Moving the frozen clock forward 60 s shows the next minute starts fresh.
+- Counters are separate **per user** and **per route** (the 2.3 finding), and the Redis key expires within 60 s.
+
+**`test_idempotency.py` (step 5).** Uses a fake Trip that creates a ride on `POST /rides`.
+- The plan's three:
+  - **Replay:** same key + same body → both 201 with the same ride, the second has `Idempotent-Replay: true`, **Trip was called once**, and the result is stored for 24 h.
+  - **Same key + different body** → 422 `IDEMPOTENCY_KEY_REUSED`.
+  - **Trip returns 5xx** → key deleted, and a retry with the same key reaches Trip again (not replayed).
+- Extra:
+  - Trip **down** → 503 and key deleted.
+  - A **4xx** (e.g. 409 "you already have a ride") *is* remembered and replayed. That's correct: the answer won't change on retry.
+  - A request still in progress → 409 `IDEMPOTENCY_IN_PROGRESS`.
+  - No key on `POST /rides` → 400.
+  - Other POSTs work without a key.
+  - Nusrat and Rafiq can use the same key string without colliding.
+  - `GET` is never tracked.
+
+**`test_proxy.py` (step 6).** The full request path through `main.py` and `proxy.py`.
+- The plan's case, made stronger: the client sends fake `X-User-Id: jashim`, `X-User-Role: ADMIN`, `X-Token-Jti`, and even a guessed `X-Internal-Token`. Trip receives **exactly one** of each header, all taken from the real token and config.
+- On a public route, the fake `X-User-*` headers are dropped and none are added.
+- `Authorization` never reaches the services. The `/api/v1` prefix is removed and the body arrives unchanged. `?tag=a&tag=b` survives. `X-Request-Id` is passed once, returned, and generated when missing.
+- **The 2.4 security fix:** three `..` / `.` paths → 404, **and no service is called at all**.
+- Unknown path → 404, no token → 401 (neither touches a service). A service's own status, body and headers (e.g. a 409) come back unchanged. Service down → 503, service too slow → 504.
+- Redis down → 503 `DEPENDENCY_UNAVAILABLE`, even on public routes, and nothing is forwarded.
+- `/health`: all six checks `ok` → 200; Trip down → 503 with `trip: fail...` and the rest `ok`.
+
+### Checking that the tests can actually fail
+
+A test that always passes proves nothing. So after they passed, I **broke the code on purpose**, one thing at a time, and ran the tests each time:
+
+| Deliberately broke... | Result |
+|---|---|
+| removed the `..` check | 3 tests failed |
+| stopped stripping client `X-User-*` / `X-Token-*` | 2 failed |
+| put back the double `X-Request-Id` | 1 failed |
+| put back the plan's `query_params` (repeated params lost) | 1 failed |
+| kept the idempotency key after a 5xx | 1 failed |
+| allowed 1 extra request over the rate limit | 2 failed |
+| skipped the revoked-token check | 1 failed |
+| removed the Redis-down handler | 1 failed |
+
+Every break was caught. Afterwards the code was restored and checked: it's byte-for-byte identical to your "Routing Table & Endpoints" commit.
+
+### Not covered by these tests
+
+- **The real Docker image.** Docker Desktop was off, so `docker build` hasn't been run yet (see 2.2 for the command).
+- **Real Redis and real services.** The fakes behave like the real things for everything the gateway uses, but the full journey (log in via Identity → request a ride via Trip) can only be tested once those services exist, in Part 8 (`scripts/e2e.sh`).
 
 ---
 
