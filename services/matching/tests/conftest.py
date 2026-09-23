@@ -39,6 +39,14 @@ async def db(db_path):
 
 
 @pytest.fixture
+async def redis():
+    import fakeredis
+    r = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    yield r
+    await r.aclose()
+
+
+@pytest.fixture
 async def dist(db):
     """The real DistanceTable, loaded from the migrated database (9 zones + the plan's overrides)."""
     from app.geo import load_distance_table

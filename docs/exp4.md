@@ -8,7 +8,7 @@
 | 4.2 | Directory structure | **Done** (explained below) |
 | 4.3 | Data layer (zones, distances, schemas) | **Done** (explained below) |
 | 4.4 | Matching algorithm (the pool planner) | **Done** (explained below) |
-| 4.5 | Fleet state in Redis (where drivers are, who's free) | Not started |
+| 4.5 | Fleet state in Redis (where drivers are, who's free) | **Done** (explained below) |
 | 4.6 | API endpoints | Not started |
 | 4.7 | Messaging integration | Not started |
 | 4.8 | Step-by-step build + tests | Not started |
@@ -159,7 +159,7 @@ Like 2.1 and 3.1, this section is a **scope definition** with no code, so I adde
 
 ## Found while reading ahead (to fix in the right section)
 
-**1. Event-timestamp ordering can go wrong (4.5).** To ignore out-of-date events, `fleet.py` compares event times **as text** (`occurred_at > last`). Part 1's `emit()` writes times with Python's `isoformat()`, which **drops the fraction of a second when it's exactly zero**:
+**1. Event-timestamp ordering can go wrong (4.5).** *Fixed in 4.5, together with two more ordering problems found there.* To ignore out-of-date events, `fleet.py` compares event times **as text** (`occurred_at > last`). Part 1's `emit()` writes times with Python's `isoformat()`, which **drops the fraction of a second when it's exactly zero**:
 
 ```
 2026-09-24T08:41:05Z           ← event exactly on a whole second
@@ -431,11 +431,108 @@ At first, "ignore the pickup zone" was **not** caught. My test case (Gulshan 1 �
 
 ---
 
+## 4.5: fleet state in Redis (`fleet.py`)
+
+This file keeps Matching's live picture of the drivers: **where** each one is, **whether** they're reachable, and **who is free**.
+
+### What's stored in Redis
+
+| Key | Type | What | Written by |
+|---|---|---|---|
+| `geo:drivers` | GEO (a sorted set with positions) | every driver's last position, for "who's within 3 km?" | GPS pings; removed when he goes offline |
+| `driver:{id}` | HASH | `lat`, `lng`, `zone`, `ping_ts` (from pings) + `online`, `pool_id` (from events) + `state_ts`, `pool_ts` (which events were applied, see below) | pings and events |
+| `driver:{id}:hb` | STRING, **expires after 30 s** | the heartbeat: "his phone spoke recently" | every ping |
+| `drivers:available` | SET | online **and** not in a live pool | events |
+| `loc:pool:{pool_id}` | Pub/Sub channel | live position for the passengers in his pool | pings (only while he has a pool) |
+
+### A GPS ping (`record_ping`), as in the plan
+
+Jashim's phone sends `lat, lng`. In **one Redis transaction**: put him on the map, save position + zone (nearest zone centre, 4.3) + time, refresh the 30 s heartbeat, and read his `pool_id`. If he has passengers, **publish** the position on `loc:pool:{pool_id}`. Notification forwards it to Nusrat's and Rafiq's phones (Part 7).
+
+A ping does **not** make him "available". Only Identity's "online" event does. An offline driver whose app keeps pinging stays invisible to matching.
+
+### Nearby search (`nearby_available`), as in the plan
+
+`GEOSEARCH` around the pickup zone's centre, radius 3 km, nearest first. It asks for **4 × the limit**, then keeps only drivers who are **in the available set *and* have a live heartbeat**, up to the limit. The heartbeat check means a driver who drove into a tunnel or whose phone died 30+ seconds ago isn't offered rides, even though Identity still says "online".
+
+### Keeping "who is free" correct: what I changed, and why
+
+The plan's `on_driver_online / offline / on_pool_updated` update Jashim's state when events arrive from Identity and Trip. There are **three** ways the plan's version could leave a wrong state behind. All three come down to **events not arriving in the order they happened**.
+
+**Why events arrive out of order at all:**
+- The consumer processes **up to 20 messages at the same time** (Part 1 sets prefetch 20, and I checked aio-pika's code: every delivered message gets its own task).
+- A message whose handler fails goes to the **retry queue and comes back 5 s later** (Part 1). By then newer events have been handled.
+
+**Problem 1: the whole-second timestamp (found in 4.1).** The plan compared event times **as text**. `08:41:05Z` (exactly on the second) sorts *after* `08:41:05.120000Z`, so a later event could be ignored as "older".
+
+**Problem 2: check-then-write race.** The plan first *read* the last applied time, then *wrote* the change in a separate step. Two events handled at the same moment could both pass the check, and whichever wrote last won, even if it was the older one.
+
+**Problem 3: pool events had no ordering at all.** `on_pool_updated` applied whatever came in. If `FORMING` failed once and came back from the retry queue *after* `COMPLETED`, Jashim would be marked **busy with a finished pool**, and never offered rides again until his next pool.
+
+**The fix: one helper, `_apply_if_newer`,** used by all three event handlers:
+1. It converts the event time to **whole microseconds** (a number, no text comparison). That fixes problem 1, and also handles `+06:00`-style times correctly.
+2. It uses Redis **`WATCH` / `MULTI`**: read the driver's state, decide, write, all as one step. If anything else touched that driver in between (another event, a ping), Redis refuses the write and the helper simply re-reads and tries again. That fixes problem 2.
+3. It keeps **two separate "last applied" clocks**: `state_ts` for Identity's online/offline events and `pool_ts` for Trip's pool events. An event older than the last one of *its own kind* is ignored. That fixes problem 3. They're separate because the two services' events are independent: an "offline" at 08:41:05.050 must still apply even if a pool event from 08:41:05.100 happened to be processed first.
+4. After every change it **recomputes "available" from the result**: `online = 1` and no `pool_id` → in the set, otherwise out. Offline → also off the map. The plan updated the set piecemeal in separate steps.
+
+It's also **safe to repeat**: the same event twice has the same time, so the second one is ignored ("at least as new was already applied"). That's why Matching needs no `processed_events` table (4.3).
+
+**The plan's code vs. the fix**, running the same scenarios (the plan's `fleet.py` taken straight from the plan file):
+
+| Scenario | Plan's version | Fixed |
+|---|---|---|
+| offline exactly on the second, online 120 ms later | ✘ stays unavailable | ✔ available |
+| older "offline" arrives after a newer "online" | ✔ | ✔ |
+| stale `FORMING` comes back from the retry queue after `COMPLETED` | ✘ stuck "busy" | ✔ available |
+| online/offline events for 40 drivers handled all at once | **0 / 40** end in the right state | **40 / 40** |
+
+(The last row uses fakeredis in one process. Real Redis would interleave differently, but the gap between "check" and "write" in the plan's version is the same.)
+
+`on_pool_updated` now takes the event's `occurred_at` as an extra argument. `consumers.py` (4.7) will pass it along.
+
+### How 4.5 was checked: 23 new tests (89 in total), all passing
+
+`test_fleet.py` runs on **fakeredis** (4.1 showed it supports `GEOSEARCH`). The plan's step 4.8.4 suggests a real Redis container, but Docker is off, and fakeredis covers every command used here.
+
+| Group | What it proves |
+|---|---|
+| Timestamps | the whole-second case sorts wrong as text, right as microseconds; `Z`, `+00:00` and `+06:00` for the same moment compare equal |
+| Online / offline | online → available; offline → not available **and off the map**; the same event twice → ignored; **offline on the second + online 120 ms later → available**; an older offline arriving late → ignored; **40 drivers × 4 events in random order, all at once → every one ends in the newest state** |
+| Pools | `FORMING` / `IN_PROGRESS` → busy; `COMPLETED` / `CANCELLED` → free again; **stale `FORMING` after `COMPLETED` → ignored** (not stuck); the end of an *old* pool doesn't free him from the *current* one; pool ends while he's offline → stays unavailable; a pool event before his online event still works; **a late offline still applies after a newer pool event** |
+| GPS pings | zone, position, time and a heartbeat that expires in ≤ 30 s are recorded; with passengers → the exact JSON is published on `loc:pool:bullet-1` (Gulshan 1 coordinates → zone `GULSHAN_1`); without passengers → nothing published; pinging while offline doesn't make him available |
+| Nearby search | nearest first (Banani ~50 m, then Gulshan 2 ~800 m); leaves out a driver 10 km away, a busy one, an offline one still pinging, and one whose heartbeat expired; respects the limit; empty map → empty list |
+
+**Break-it checks:**
+
+| Deliberately broke... | Result |
+|---|---|
+| replays applied again (`>=` → `>`) | 1 failed |
+| went back to comparing times as text | 4 failed |
+| let the end of *any* pool free the driver | 1 failed |
+| kept offline drivers on the map | 1 failed |
+| heartbeat never expires | 1 failed |
+| nearby search ignores the heartbeat | 1 failed |
+| made pool events share the online/offline clock | **0 failed at first** → added two tests (a pool ending after a late "online", and a late "offline" after a pool event) → now 2 fail |
+
+### Same bug elsewhere: Trip (Part 5)
+
+The plan's Trip consumer has the same text comparison: `if shift.state_ts >= ts: return`. So **Trip could also ignore Jashim's "online" if his previous "offline" landed exactly on a whole second.** Matching's fix doesn't depend on it, but the simplest cure for every service is **one line in Part 1's `emit()`**:
+
+```python
+"occurred_at": utcnow().isoformat(timespec="microseconds") + "Z",   # always 6 decimals
+```
+
+With a fixed width, text order = time order everywhere. I haven't changed Part 1 without asking. I recommend doing it before Part 5.
+
+---
+
 ## Things to know before the next sections
 
 - **Build order:** the plan builds Matching **third** (after the common lib and Identity), because Fare and Trip both depend on it.
 - **Two data stores:** `matching.db` (SQLite: zones and distances, which barely change) and **Redis** (positions and availability, which change constantly). Zones are loaded **into memory at startup** (4.8 step 5), so answering "Banani → Mohakhali?" never even touches the database.
 - **Matching's "who is free" is eventually consistent** (a fraction of a second behind Identity and Trip). By design this is harmless, because Trip re-checks everything atomically when it books.
 - **Docker is still off**, but thanks to fakeredis's GEO support that won't block the Matching tests.
+- **Recommended before Part 5:** the one-line `emit()` change above (fixed-width timestamps), so Trip's consumer can't hit the whole-second bug.
+- **`consumers.py` (4.7) must pass `occurred_at` to `on_pool_updated`** (its signature gained that argument in 4.5).
 - **Changing a CHECK rule needs a hand-written migration** (Alembic's autogenerate and `alembic check` don't see CHECK rules; found in 4.3).
 - **Fare will cache these distances for 24 h** (Part 6). If an override is ever changed, Fare's cache (`fare:dist:*` in Redis) must be cleared, or prices will use the old distance for up to a day.
