@@ -36,3 +36,11 @@ async def db(db_path):
     database = Database(str(db_path))
     yield database
     await database.dispose()
+
+
+@pytest.fixture
+async def dist(db):
+    """The real DistanceTable, loaded from the migrated database (9 zones + the plan's overrides)."""
+    from app.geo import load_distance_table
+    async with db.ro() as s:
+        return await load_distance_table(s)

@@ -5,13 +5,7 @@ import pytest
 
 from tesla_common.errors import DomainError
 
-from app.geo import DistanceTable, haversine_m, load_distance_table
-
-
-@pytest.fixture
-async def dist(db) -> DistanceTable:
-    async with db.ro() as s:
-        return await load_distance_table(s)
+from app.geo import haversine_m
 
 
 def test_haversine_one_degree_of_latitude():

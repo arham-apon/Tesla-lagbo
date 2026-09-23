@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 NEW_RIDE = "__new__"
 
@@ -27,6 +27,13 @@ class EvaluateIn(BaseModel):
     seats: int = Field(ge=1, le=6)
     open_pools: list[OpenPool] = []
     max_candidates: int = Field(default=5, ge=1, le=20)
+
+    @model_validator(mode="after")
+    def _distinct(self):
+        # Same rule as Trip's RideCreate. A 0 m solo distance would divide by zero in the planner.
+        if self.pickup_zone == self.dropoff_zone:
+            raise ValueError("pickup_zone and dropoff_zone must differ")
+        return self
 
 
 class PoolOption(BaseModel):

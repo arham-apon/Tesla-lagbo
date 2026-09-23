@@ -7,7 +7,7 @@
 | 4.1 | Overview & domain scope | **Done** (explained below) |
 | 4.2 | Directory structure | **Done** (explained below) |
 | 4.3 | Data layer (zones, distances, schemas) | **Done** (explained below) |
-| 4.4 | Matching algorithm (the pool planner) | Not started |
+| 4.4 | Matching algorithm (the pool planner) | **Done** (explained below) |
 | 4.5 | Fleet state in Redis (where drivers are, who's free) | Not started |
 | 4.6 | API endpoints | Not started |
 | 4.7 | Messaging integration | Not started |
@@ -332,6 +332,102 @@ cd services\matching
 | **deleted the `from_zone <> to_zone` rule from `models.py`** | **0 failed** |
 
 The last one is a real limitation worth knowing: **`alembic check` doesn't compare CHECK rules.** It notices new or removed tables, columns, indexes and foreign keys, but not a changed or deleted `CheckConstraint`. The tests still pass because the database is built by the migration, which still has the rule. So the *database* stays protected, but `models.py` and the migration can quietly disagree about CHECK rules. The same is true for Identity. The practical rule: **when you change a CHECK rule in `models.py`, write the migration by hand.** Autogenerate won't do it for you.
+
+---
+
+## 4.4: the matching algorithm (`planner.py`)
+
+This is the brain of the pooling idea: **"can this new rider share that car, and in which order should the car drop everyone off?"**
+
+### The rules (plan decision A4)
+
+A new rider may join an open pool only if **all** of these hold:
+
+1. **Same pickup zone.** Everyone in Bullet gets picked up in Banani. The car collects everybody, then drives the drop-offs. (That's also why pickups never need ordering: they're all in one place.)
+2. **Enough seats left:** `remaining_seats ≥ seats wanted`.
+3. **Nobody rides more than 140 % of their solo distance.** "Solo distance" = straight from the pickup zone to your own drop-off. "In-vehicle distance" = what you actually ride, including other people's drop-offs before yours. For **every** rider, old and new: `in-vehicle × 100 ≤ solo × 140`.
+
+(A fourth rule, "the pool hasn't started yet", is Trip's: it only sends pools that are still `FORMING`.)
+
+### How it works, step by step
+
+For each open pool Trip sent (`plan_for_pool`):
+
+1. Skip it if the pickup zone differs or there aren't enough seats.
+2. Work out everyone's **solo distance** (the new rider's too).
+3. Try putting the new drop-off **in every possible position** among the existing drop-offs: first, second, ..., last. **The existing riders keep their order**; only the newcomer is slotted in.
+4. For each position, drive the route and check rule 3 for **every** rider.
+5. Of the positions that pass, keep the one with the **shortest total route**.
+
+Then `rank_pools` sorts all pools that fit: **least extra driving first**, and on a tie, the **lower worst-detour** first.
+
+**Why integers only:** the 140 % test is written as `in_vehicle × 100 ≤ solo × 140`, with no division, so there's no floating-point rounding. Exactly 140 % is allowed; 140.1 % is not. That is checked by a test.
+
+### The worked example, checked by the tests
+
+**Rafiq (Banani → Gulshan 1) joins Nusrat (Banani → Mohakhali) in Bullet:**
+
+| Order tried | Route | Rafiq rides | Nusrat rides | OK? |
+|---|---|---|---|---|
+| **G1 first** | B → G1 (2000) → M (+2000) = **4000** | 2000 / 2000 = **100 %** | 4000 / 3500 = **114 %** | ✔ |
+| G1 last | B → M (3500) → G1 (+2000) = 5500 | 5500 / 2000 = **275 %** | 3500 / 3500 = 100 % | ✘ |
+
+Result: `PICKUP Nusrat @Banani, PICKUP Rafiq @Banani, DROPOFF Rafiq @Gulshan 1, DROPOFF Nusrat @Mohakhali`, total 4,000 m, **+500 m** of extra driving, worst detour **114 %**. Exactly the plan's numbers.
+
+**Shirin wants 2 seats:** Bullet (3 seats) now has 1 left → rejected on seats, before any distance is calculated.
+
+### An extra example: a third rider (hand-checked)
+
+After Rafiq joined, Karim wants Banani → **Gulshan 2** (1 seat; exactly 1 is left):
+
+| Order tried | Route | Karim | Rafiq | Nusrat | OK? |
+|---|---|---|---|---|---|
+| **G2, G1, M** | 1000 → 2700 → **4700** | 100 % | 2700/2000 = 135 % | 4700/3500 = 134 % | ✔ |
+| G1, G2, M | 2000 → 3700 → 6100 | 3700/1000 = 370 % | | | ✘ |
+| G1, M, G2 | 2000 → 4000 → 6400 | 6400/1000 = 640 % | | | ✘ |
+
+Karim is dropped **first**. Rafiq and Nusrat keep their order. Total 4,700 m (+700), worst detour 135 %. Bullet is now full (3/3).
+
+### The one change: reject "pickup = drop-off" at the door (a real crash)
+
+If a request had the **same pickup and drop-off** zone, the newcomer's solo distance is **0 m**, and the plan's planner does `in_vehicle × 100 // solo`. I ran the plan's code with such a request:
+
+```
+plan's planner with pickup == dropoff -> ZeroDivisionError integer division or modulo by zero
+```
+
+That would reach Trip as a bare **500**. Trip's own `RideCreate` already refuses pickup = drop-off (Part 5), so normally this can't happen. But Matching shouldn't rely on its caller being perfect. **Fix:** `EvaluateIn` now has **the same rule as Trip's `RideCreate`** (a `model_validator`), so such a request gets a clean **422** before the planner runs. The planner itself is **exactly the plan's code**, unchanged.
+
+### What the planner deliberately does *not* do
+
+- **It never reorders existing riders.** Nusrat was promised "Rafiq first, then you". A later rider can slot in, but never shuffle the others. That keeps each rider's experience predictable, and the search tiny (for 3 seats: at most 3 positions to try).
+- **It doesn't look at where the driver is.** Pools are compared on route shape only. Finding *nearby drivers* is a separate step (4.5), used only when no pool fits.
+- **It doesn't reserve anything.** It returns options; Trip books atomically (4.1). Every option carries the pool's `version`, so if two riders are offered the last seat at once, only one of Trip's writes succeeds.
+
+### How 4.4 was checked: 17 new tests (66 in total), all passing
+
+`test_planner.py` runs on the **real distance table** loaded from a migrated database, so the numbers are the ones production will use.
+
+| Group | What it proves |
+|---|---|
+| **The plan's three (4.8 step 3)** | Rafiq accepted, **Gulshan 1 before Mohakhali**, total 4000 / +500 / 114 %, version passed through; the G1-last order computes to 5500 m with Rafiq at 275 % (never offered); **Shirin (2 seats, 1 left) rejected**; **different pickup zone rejected** (including a case, Gulshan 2 → Uttara, that the 140 % rule alone would *allow* at 139 %; only the same-pickup rule stops it) |
+| More cases | the third-rider example above (4700 / +700 / 135 %); existing riders keep their order; same destination costs +0 m at 100 %; Uttara is rejected (145 % / 768 %); a stricter 110 % limit blocks Rafiq; a full pool is rejected; **exactly 140 % allowed, 140.1 % not** (on a small made-up map) |
+| Ranking | least extra driving first; wrong-pickup pools left out; ties keep Trip's order; no open pools → empty list |
+| Bad input | pickup = drop-off → 422 before planning; unknown drop-off zone → `UNKNOWN_ZONE`; all results are whole numbers |
+
+**Break-it checks:**
+
+| Deliberately broke... | Result |
+|---|---|
+| exactly 140 % no longer allowed (`>` → `>=`) | 1 failed |
+| require a spare seat (`<` → `<=`) | 2 failed |
+| ignore the pickup zone | 1 failed (after I strengthened the test, see below) |
+| rank *most* extra driving first | 1 failed |
+| only try the new drop-off in last position | 5 failed |
+| plan without the pickup stops | 1 failed |
+| allow pickup = drop-off | 1 failed |
+
+At first, "ignore the pickup zone" was **not** caught. My test case (Gulshan 1 → Mohakhali into a Banani pool) happened to fail the 140 % rule anyway, so it never really tested the pickup rule. I added the Gulshan 2 → Uttara case, which passes the 140 % rule, and now the break is caught. That's exactly why these break-it checks are worth doing.
 
 ---
 
