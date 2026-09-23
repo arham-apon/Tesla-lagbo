@@ -7,7 +7,7 @@
 | 3.1 | Overview & domain scope | **Done** (explained below) |
 | 3.2 | Directory structure | **Done** (explained below) |
 | 3.3 | Data layer (tables, models, schemas, tokens) | **Done** (explained below) |
-| 3.4 | API endpoints | Not started |
+| 3.4 | API endpoints | **Done** (explained below) |
 | 3.5 | Messaging integration | Not started |
 | 3.6 | Step-by-step build + tests | Not started |
 
@@ -294,7 +294,7 @@ auth = InternalAuth(settings.INTERNAL_TOKEN)        # Part 1: auth.role("DRIVER"
 trip_client = ServiceClient(settings.TRIP_URL, ...) # Part 1: for the offline check
 ```
 
-Exactly what the plan's note says `deps.py` contains. Redis for logout gets added here in 3.4.
+Exactly what the plan's note says `deps.py` contains. 3.4 added Redis (for logout) and the private-key loader.
 
 ### How 3.2 and 3.3 were checked: 45 tests, all passing
 
@@ -317,11 +317,126 @@ Note: the "vehicle for a non-existent driver" test only passes because Part 1's 
 
 ---
 
+## 3.4: the API endpoints
+
+### The endpoint list
+
+What the services see is the gateway URL **minus `/api/v1`**, so a phone calling `POST /api/v1/auth/login` reaches Identity's `POST /auth/login`.
+
+| Method | Route | Who | Success | Errors | File |
+|---|---|---|---|---|---|
+| POST | `/auth/register` | anyone (via gateway) | 201 `UserOut` | 409 `PHONE_TAKEN`, 409 `LICENSE_TAKEN`, 422 `LICENSE_REQUIRED` / `VALIDATION_ERROR` | `routers/auth.py` |
+| POST | `/auth/login` | anyone (via gateway) | 200 `TokenOut` | 401 `INVALID_CREDENTIALS` | `routers/auth.py` |
+| POST | `/auth/logout` | any logged-in user | 204 | 400 `TOKEN_CONTEXT_MISSING` | `routers/auth.py` |
+| GET | `/users/me` | any logged-in user | 200 `UserOut` | 404 | `routers/auth.py` |
+| GET | `/drivers/me` | DRIVER | 200 `DriverOut` | 404 | `routers/drivers.py` |
+| PUT | `/drivers/me/vehicle` | DRIVER | 200 `VehicleOut` | 409 `DRIVER_ONLINE`, 409 `PLATE_TAKEN` | `routers/drivers.py` |
+| POST | `/drivers/me/online` | DRIVER | 200 `DriverOut` | 409 `NO_VEHICLE` | `routers/drivers.py` |
+| POST | `/drivers/me/offline` | DRIVER | 200 `DriverOut` | 409 `DRIVER_HAS_LIVE_POOL`, 503 if Trip can't answer | `routers/drivers.py` |
+| GET | `/internal/users/{id}` | other services only | 200 `UserOut` | 404 | `routers/internal.py` |
+
+Every route needs the **`X-Internal-Token`**, meaning the request must have come through the gateway (or from another service). "Anyone" means *no login needed*, not *reachable from the internet directly*. Wrong role → 403 `FORBIDDEN` (from Part 1's `auth.role("DRIVER")`).
+
+### Register (`POST /auth/register`)
+
+Nusrat signs up:
+
+1. The schema checks the input (3.3). A `DRIVER` must also send a `license_number`, else 422 `LICENSE_REQUIRED`.
+2. **Hash the password first, outside the database lock.** argon2 takes ~75 ms on purpose. Doing that *inside* the write transaction would hold SQLite's single write lock for 75 ms per signup, blocking everyone else's writes. It also runs in a **thread** (`run_in_threadpool`), so the server keeps answering other requests meanwhile.
+3. In **one** transaction: phone already used → 409 `PHONE_TAKEN`; licence already used → 409 `LICENSE_TAKEN`; otherwise insert `users` (+ `drivers` for Jashim). Because it's one `BEGIN IMMEDIATE` transaction, two people registering the same phone at the same instant can't both pass the check: the second waits, then sees the first.
+4. Return `UserOut` (no password hash).
+
+The user's id is set **in Python** (`new_id()`) before insert, so the `drivers` row can use it in the same transaction. This also relies on the 3.3 relationship fix.
+
+### Login (`POST /auth/login`)
+
+1. Look up the phone number (read-only session: never blocks writers).
+2. Check the password with argon2. **If the phone doesn't exist, check against a dummy hash anyway.** Otherwise "unknown phone" would answer instantly and "wrong password" after 75 ms, and an attacker could time the responses to learn which numbers have accounts. Measured on this PC:
+
+   | Case | Time |
+   |---|---|
+   | wrong password, real user | 74.8 ms |
+   | unknown phone (dummy check) | 75.5 ms |
+
+   Both also return the **exact same** 401 body.
+3. On success, `issue_token()` (3.3) signs a 1-hour JWT with the private key. The response is `{access_token, token_type: "bearer", expires_in: 3600, user}`.
+
+### Logout (`POST /auth/logout`)
+
+The gateway has already verified the token and forwards its `X-Token-Jti` and `X-Token-Exp` (Part 2.4). Identity writes `auth:revoked:{jti}` to Redis with a TTL of `exp − now`, so the key disappears exactly when the token would have expired anyway. Afterwards, the gateway rejects that token with 401 `TOKEN_REVOKED`.
+- A token that has **already expired** → nothing to write (still 204).
+- Headers missing (the request didn't come through the gateway) → 400 `TOKEN_CONTEXT_MISSING`.
+
+### Vehicle (`PUT /drivers/me/vehicle`), an "upsert"
+
+"Upsert" = **create if missing, update if present**. Jashim's first PUT creates Bullet. A later PUT changes Bullet (same vehicle id), never a second car.
+- **Online → 409 `DRIVER_ONLINE`.** The seat count was announced when he went online (3.1), so it can't change mid-shift.
+- **Plate used by *another* driver → 409 `PLATE_TAKEN`.** Re-sending his own plate is fine.
+
+### Going online (`POST /drivers/me/online`)
+
+The plan's code, unchanged. No vehicle → 409 `NO_VEHICLE`. Otherwise, **in one transaction**: set `ONLINE` and put an `identity.driver.online` event in the outbox:
+
+```json
+{"driver_id": "1111...", "driver_name": "Jashim", "vehicle_id": "...",
+ "vehicle_nickname": "Bullet", "plate": "DHAKA-TESLA-11", "seat_capacity": 3}
+```
+
+That event carries everything Trip and Matching need, so they never have to call Identity back. **Already online → 200 and no second event**, so tapping the button twice is harmless.
+
+### Going offline (`POST /drivers/me/offline`)
+
+1. **Ask Trip first**, *before* opening a transaction (never hold the database lock while waiting on the network): `GET /internal/drivers/{id}/live-pool`, with the request id passed along and one retry.
+2. Trip says `{"pool_id": "..."}` → 409 `DRIVER_HAS_LIVE_POOL`. Jashim stays online.
+3. Trip says `{"pool_id": null}` → set `OFFLINE` + outbox event `identity.driver.offline` in one transaction.
+
+**One change from the plan (a real bug):** the plan went straight to `resp.json().get("pool_id")`. Part 1's `ServiceClient` only treats **5xx** as failure. So if Trip answered **401** (e.g. the two services have different `INTERNAL_TOKEN`s after a config mistake) or **404**, the error body has no `pool_id`, and that reads as "no pool": **Jashim could go offline with Nusrat and Rafiq still in the car.** Now anything other than 200 → 503, and he stays online. That's **fail closed**: when unsure, keep the safe state.
+
+**The known gap the plan documents:** between Trip answering "no pool" and Identity's commit, a few milliseconds pass. In that window Jashim could still accept a brand-new offer. Trip checks its own `driver_shifts` copy before accepting, and that copy flips to offline as soon as Trip processes the `identity.driver.offline` event, so the window is tiny. The plan accepts it rather than adding a cross-service lock. Doing it perfectly would need both services in one transaction, which separate databases can't have.
+
+### `deps.py` additions
+
+- `redis`, for logout's `auth:revoked:*` key.
+- `private_key()` reads `jwt_private.pem` **once** and caches it. Identity is the only service that has this file (Part 8 mounts the whole `keys/` folder only into Identity).
+
+### How 3.4 was checked: 77 tests, all passing
+
+The plan builds `main.py` (RabbitMQ bus, outbox relay, health) in 3.6 step 6. For 3.4, the tests mount the three routers on a small test app, with:
+- a fresh migrated database per test (as in 3.3),
+- **fakeredis** for logout,
+- a **fake Trip** that can answer "no pool", "pool X", 401/404/500, or be down (Trip itself is built in Part 5),
+- request headers exactly as the gateway sends them (`X-Internal-Token`, `X-User-*`, `X-Token-*`).
+
+| File | Tests | What it proves |
+|---|---|---|
+| `test_auth_api.py` | 15 | register a passenger (argon2id hash stored, never the password; no hash in the response); register a driver (drivers row, `OFFLINE`, no vehicle); driver without licence → 422; duplicate phone → 409; duplicate licence → 409 **and nothing half-saved**; bad phone → 422; no internal token → 401; **login token passes the gateway's `verify_jwt`**; wrong password and unknown phone give **identical** 401s; logout stores the revocation with TTL ≈ remaining lifetime; already-expired → nothing stored; missing token headers → 400; `/users/me`; `/internal/users/{id}` needs the internal token |
+| `test_drivers_api.py` | 17 | **passenger → `/drivers/me/online` = 403** (plan 3.6 step 8); starts offline with no vehicle; online without vehicle → 409 and no event; vehicle upsert keeps the same id; plate clash → 409; 9 seats → 422; online announces Bullet with all fields; online twice → one event; **edit while online → 409** (plan 3.6 step 8) and the seat count is unchanged; offline asks Trip at the right URL with the internal token and request id, then emits `offline`; **passengers aboard → 409, still online, no event**; Trip down / 500 / **401 / 404** → 503, still online; offline when already offline → no event |
+| earlier files | 45 | migrations, models, schemas, tokens (3.3) |
+
+**Checking the tests can fail**, as in 2.6. I broke the code on purpose, one thing at a time:
+
+| Deliberately broke... | Result |
+|---|---|
+| put back the plan's offline check (no "must be 200") | 2 failed (the 401 and 404 cases) |
+| allowed vehicle edits while online | 1 failed |
+| emitted "online" every time | 1 failed |
+| ignored Trip's live pool | 1 failed |
+| let register work without the internal token | 1 failed |
+| made logout store nothing | 1 failed |
+| removed the duplicate-licence check | 1 failed |
+
+All caught; the code was restored and checked identical afterwards.
+
+**Not covered yet:** that the outbox events actually reach RabbitMQ (needs `main.py`'s outbox relay, 3.6), and the real Trip (Part 5).
+
+---
+
 ## Things to know before the next sections
 
-- **Identity is built before Trip** (plan build order: step 2 vs step 5), but going offline calls Trip. Until Part 5 exists, the offline check can only be tested against a **fake Trip**, the same trick used for the gateway tests.
+- **Identity is built before Trip** (plan build order: step 2 vs step 5), but going offline calls Trip. Until Part 5 exists, the offline check can only be tested against a **fake Trip**, the same trick used for the gateway tests. In a real run before Trip exists, `POST /drivers/me/offline` will answer **503** (by design: fail closed).
+- **`main.py` is still a placeholder.** The endpoints exist and are tested, but the service can't be started with `uvicorn` until 3.6 step 6 wires up the app, RabbitMQ and the outbox relay.
 - **No way to create an `ADMIN` yet.** The role exists, but registration only accepts `PASSENGER` or `DRIVER`, and the seed data has no admin. That's fine for now (nothing requires an admin); worth knowing if an admin tool is wanted later.
-- **A small known gap, from the plan itself:** between "Trip says Jashim has no pool" and "Jashim is marked offline", a few milliseconds pass in which he could still accept a new offer. Trip closes this as soon as it processes the `offline` event. The plan says to document it rather than fix it, and I'll cover it properly in 3.4.
+- **A small known gap, from the plan itself:** between "Trip says Jashim has no pool" and "Jashim is marked offline", a few milliseconds pass in which he could still accept a new offer. Trip closes this as soon as it processes the `offline` event. The plan says to document it rather than fix it; explained in 3.4 ("Going offline").
 - **`argon2-cffi` and `alembic` are now installed** in `.venv` (3.2).
 - **The gateway's `config.py` doesn't read a local `.env`** the way Identity's now does (Part 8.3's "run a service outside Docker" needs it). It's a small fix, worth making before Part 8. It doesn't affect Docker, where `env_file: .env` provides the variables.
 - **Future migrations and unnamed UNIQUE rules:** the plan gives the CHECK rules names (`ck_user_role`...) but not the UNIQUE ones. That's fine now; if a later migration ever needs to *drop* one of those UNIQUE rules on SQLite, it will have to name it by hand.
