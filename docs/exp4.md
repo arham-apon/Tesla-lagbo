@@ -10,10 +10,15 @@
 | 4.4 | Matching algorithm (the pool planner) | **Done** (explained below) |
 | 4.5 | Fleet state in Redis (where drivers are, who's free) | **Done** (explained below) |
 | 4.6 | API endpoints | **Done** (explained below) |
-| 4.7 | Messaging integration | Not started |
-| 4.8 | Step-by-step build + tests | Not started |
+| 4.7 | Messaging integration | **Done** (explained below) |
+| 4.8 | Step-by-step build + tests | **Done** (explained below) |
 
-This file grows as each section gets done.
+**Part 4 is complete.** Location & Matching is written and covered by 127 automated tests, all passing. Run them with:
+
+```
+cd services\matching
+..\..\.venv\Scripts\python -m pytest
+```
 
 ---
 
@@ -622,6 +627,138 @@ The routers read everything from `request.app.state`, so the tests build a small
 
 ---
 
+## 4.7: messaging integration
+
+The plan says:
+
+> - **Produces (RabbitMQ):** none. **Produces (Redis Pub/Sub):** `loc:pool:{pool_id}` on every ping of a driver with a live pool.
+> - **Consumes:** queue `matching.fleet-state`, bindings `identity.driver.*`, `trip.pool.updated`.
+
+So Matching is the **mirror image of Identity** (Part 3.5): Identity only *sends* events, Matching only *receives* them.
+
+### What it sends: positions, not events
+
+Matching publishes **nothing** on RabbitMQ. Its only "message" is the live position on Redis Pub/Sub, done by `record_ping` (4.5) and tested there:
+
+```
+Jashim's ping ──▶ Matching ──PUBLISH loc:pool:bullet-1──▶ Redis ──▶ Notification ──▶ Nusrat's & Rafiq's maps
+```
+
+Nothing Matching decides needs to be announced. Its evaluate answers go straight back to Trip over HTTP, and *Trip* announces the resulting ride and pool changes.
+
+### What it receives
+
+```
+RabbitMQ exchange tesla.events
+   │  identity.driver.online / .offline   (Identity, Part 3)
+   │  trip.pool.updated                   (Trip, Part 5)
+   ▼
+queue matching.fleet-state  ──▶  consumers.handle()  ──▶  fleet.py (4.5)  ──▶  Redis "who is free"
+   │ on failure: .retry (5 s) ×3 ──▶ .dlq  (Part 1)
+```
+
+| Event | Handled by | Effect |
+|---|---|---|
+| `identity.driver.online` | `on_driver_online` | online; available if not in a pool |
+| `identity.driver.offline` | `on_driver_offline` | offline; unavailable; off the map |
+| `trip.pool.updated` | `on_pool_updated` | `FORMING`/`IN_PROGRESS` → busy; `COMPLETED`/`CANCELLED` → free (if it's his current pool) |
+| anything else | ignored | (the bindings shouldn't let anything else in anyway) |
+
+### `consumers.py`
+
+The plan's code, with **one change**: it passes the event's **`occurred_at`** to `on_pool_updated` as well. That's the pool-event ordering from 4.5, which stops a stale `FORMING` from the retry queue from leaving Jashim stuck "busy". The queue name and bindings are now named constants (`QUEUE`, `BINDINGS`), so the tests can check them.
+
+**The bindings, checked against the whole event registry (Part 0.4):** of the 9 routing keys in the system, `identity.driver.*` + `trip.pool.updated` let in **exactly** the 3 Matching needs. Not `trip.ride.*`, not `fare.ride.settled`. RabbitMQ's `*` means *exactly one word*, so `identity.driver.*` matches `identity.driver.online` but would not match a future `identity.driver.vehicle.changed`. That keeps Matching from silently receiving events it doesn't understand.
+
+### No `processed_events`, and why that's safe
+
+Most consumers in the system record each `event_id` so a redelivered event is skipped (Part 1's `first_time()`). Matching doesn't (4.3), and 4.5 is why that's safe: every handler **compares the event's time with the last applied one** and ignores anything not newer. The same event delivered twice has the same time, so the second copy changes nothing. There's a test for that: redeliver an already-applied "online" after the set was changed by something else, and the set stays as it is.
+
+### Failures
+
+If a handler raises (Redis down, or a malformed event missing `driver_id`), the exception reaches Part 1's `Bus.consume`, which sends the message to **`matching.fleet-state.retry`** (back after 5 s), and after 3 retries to **`matching.fleet-state.dlq`** for a human to look at. The tests check that both cases really *raise*, instead of being silently swallowed and lost.
+
+---
+
+## 4.8: the step-by-step guide
+
+| Step | Plan says | Where / status |
+|---|---|---|
+| 1 | models + migrations `0001_init`, `0002_seed_zones` (`op.bulk_insert`) | **4.2 / 4.3** |
+| 2 | `geo.py` + tests: `BANANI→MOHAKHALI == 3500`, symmetric overrides, unknown zone → 422 | **4.3** |
+| 3 | `planner.py` + tests: Rafiq accepted with G1 before M, Shirin rejected on seats, different pickup rejected | **4.4** |
+| 4 | `fleet.py`; test against a real Redis ("fakeredis lacks full GEOSEARCH on some versions") | **4.5**, on fakeredis 2.38, which *does* support it (checked in 4.1). Docker is off |
+| 5 | routers; lifespan loads zones + overrides into `app.state.dist`, creates Redis, connects bus, starts consumer | routers **4.6**; **lifespan: done now** |
+| 6 | health: DB + Redis + RabbitMQ | **done now** |
+
+### `main.py` (steps 5 and 6)
+
+```
+lifespan:
+    configure_logging("matching")
+    load zones + distance table from matching.db  → app.state.zones, app.state.dist   (once, into memory)
+    no zones?  → refuse to start: "run `alembic upgrade head` first"
+    Redis client                                   → app.state.redis
+    bus.connect()                                  → RabbitMQ (unreachable → refuse to start)
+    consumers.start()                              → queue matching.fleet-state
+    ── serving ──
+    close bus, Redis, database
+app: error format + /health (db, redis, rabbitmq) + the three routers
+```
+
+**One addition: "refuse to start without zones".** If someone started the service on a database where the seed migration hadn't run, every request would answer 422 `UNKNOWN_ZONE` ("Banani doesn't exist"). That's confusing, and it looks like a user error. Now the service **won't start at all** and says exactly what to do. In Docker this can't happen (the container runs `alembic upgrade head` first), but when running it by hand it can.
+
+**Unlike Identity, there's no outbox relay here**, because Matching publishes no events (4.7). So shutdown is simpler: close the bus, Redis and the database.
+
+### Running the real commands
+
+| Command | Result |
+|---|---|
+| `alembic upgrade head` (fresh database) | `-> 0001, init`, then `0001 -> 0002, seed zones` |
+| `uvicorn app.main:app` **with no RabbitMQ** | zones load, then it refuses to start (`AMQPConnectionError`), as intended |
+
+As with Identity, **Matching against a real RabbitMQ and Redis wasn't run** (Docker is off). Part 1 tested the bus itself against real RabbitMQ, and everything Matching adds on top is tested below with a fake bus and fakeredis.
+
+### Tests: 127, all passing
+
+| File | Tests | Section |
+|---|---|---|
+| `test_migrations.py` | 5 | 4.3 |
+| `test_models.py` | 6 | 4.3 |
+| `test_schemas.py` | 25 | 4.3 |
+| `test_geo.py` | 13 | 4.3 |
+| `test_planner.py` | 17 | 4.4 |
+| `test_fleet.py` | 23 | 4.5 |
+| `test_api.py` | 20 | 4.6 |
+| `test_consumers.py` | 10 | **4.7** |
+| `test_main.py` | 8 | **4.8** |
+
+**`test_consumers.py` (4.7)** builds its events with **Part 1's real `emit()`**, the same function Identity and Trip use, so the format is exactly what will arrive over RabbitMQ:
+- the bindings let in exactly the 3 needed keys out of the 9 in the registry, and `start()` declares `matching.fleet-state` with them;
+- Identity's full online event → online; online then offline → unavailable (added after a break-it check, see below); a pool's life `FORMING` → `COMPLETED` → busy, then free;
+- **`emit()` really writes `...08:41:05Z` on a whole second** (confirmed), and an online 120 ms later is still applied;
+- redelivering the same event changes nothing; other event types touch nothing;
+- Redis down → the handler raises (so the bus retries); an event missing `driver_id` → raises (so it ends in the DLQ).
+
+**`test_main.py` (4.8)** runs the **real `app.main.app`** with its lifespan, on a migrated temp database, fakeredis and a fake bus:
+- startup loads 9 zones and the distance table, and registers the consumer with the right queue and bindings;
+- **the Banani story through the real app:** an `online` event delivered to the registered consumer → Jashim pings from Banani (202, zone BANANI) → evaluate for Nusrat → candidates `[jashim]`, solo 3500;
+- all routes mounted; `/health` → 200 with `db`, `redis` and `rabbitmq` all ok; broker gone → 503 naming `rabbitmq`; Redis gone → 503 naming `redis`;
+- shutdown closes the bus; **a database without zones → refuses to start** with the "run `alembic upgrade head`" message.
+
+**Break-it checks:**
+
+| Deliberately broke... | Result |
+|---|---|
+| binding widened to `trip.pool.*` | 2 failed |
+| binding `identity.*` (one word, so it matches nothing Identity sends) | 3 failed |
+| offline events not handled | **0 failed at first** → added the online-then-offline test → now 1 fails |
+| consumer never started | 2 failed |
+| allowed starting without zones | 1 failed |
+| bus not closed on shutdown | 1 failed |
+
+---
+
 ## Things to know before the next sections
 
 - **Build order:** the plan builds Matching **third** (after the common lib and Identity), because Fare and Trip both depend on it.
@@ -630,6 +767,8 @@ The routers read everything from `request.app.state`, so the tests build a small
 - **Docker is still off**, but thanks to fakeredis's GEO support that won't block the Matching tests.
 - **Recommended before Part 5:** the one-line `emit()` change above (fixed-width timestamps), so Trip's consumer can't hit the whole-second bug.
 - **Part 1's `errors.py` was fixed in 4.6** (422s from `model_validator`s used to crash into 500s). All services use the fixed version automatically: `tesla_common` is installed in editable mode, and Docker copies `libs/common` fresh.
-- **`consumers.py` (4.7) must pass `occurred_at` to `on_pool_updated`** (its signature gained that argument in 4.5).
+- **`consumers.py` passes `occurred_at` to `on_pool_updated`** (done in 4.7).
+- **Running Matching for real** needs the zones migrated (`alembic upgrade head`), plus RabbitMQ and Redis. Without zones or RabbitMQ it refuses to start, on purpose.
+- **Trip (Part 5) must send `trip.pool.updated` with `driver_id`, `pool_id`, `status`** (the registry's fields). Matching's consumer depends on exactly those three.
 - **Changing a CHECK rule needs a hand-written migration** (Alembic's autogenerate and `alembic check` don't see CHECK rules; found in 4.3).
 - **Fare will cache these distances for 24 h** (Part 6). If an override is ever changed, Fare's cache (`fare:dist:*` in Redis) must be cleared, or prices will use the old distance for up to a day.
