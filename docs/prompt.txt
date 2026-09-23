@@ -5,4 +5,9 @@ now complete 2.1 of the  implementation plan.
 
 
 
-git add . && git commit -m "identity service api rndpoints created" && git push
+git add . && git commit -m "driver status messaging service" && git push
+
+
+git branch trip-service
+
+git checkout trip-service

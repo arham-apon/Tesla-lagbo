@@ -8,10 +8,15 @@
 | 3.2 | Directory structure | **Done** (explained below) |
 | 3.3 | Data layer (tables, models, schemas, tokens) | **Done** (explained below) |
 | 3.4 | API endpoints | **Done** (explained below) |
-| 3.5 | Messaging integration | Not started |
-| 3.6 | Step-by-step build + tests | Not started |
+| 3.5 | Messaging integration | **Done** (explained below) |
+| 3.6 | Step-by-step build + tests | **Done** (explained below) |
 
-This file grows as each section gets done.
+**Part 3 is complete.** Identity is written and covered by 94 automated tests, all passing. Run them with:
+
+```
+cd services\identity
+..\..\.venv\Scripts\python -m pytest
+```
 
 ---
 
@@ -427,18 +432,168 @@ The plan builds `main.py` (RabbitMQ bus, outbox relay, health) in 3.6 step 6. Fo
 
 All caught; the code was restored and checked identical afterwards.
 
-**Not covered yet:** that the outbox events actually reach RabbitMQ (needs `main.py`'s outbox relay, 3.6), and the real Trip (Part 5).
+**Not covered in 3.4:** that the outbox events actually get published (done in 3.6 with the relay running), and the real Trip (Part 5).
+
+---
+
+## 3.5: messaging integration
+
+The plan says:
+
+> - **Produces:** `identity.driver.online`, `identity.driver.offline` (via outbox relay).
+> - **Consumes:** none.
+> - **Redis:** `SET auth:revoked:{jti} 1 EX <remaining>` on logout.
+
+Unlike the gateway (Part 2.5: "none, none"), Identity **does** talk to the event system, but only in one direction.
+
+### What it sends, and who listens
+
+```
+Jashim taps "Go online"
+   │
+   ▼
+Identity: ONE transaction ── drivers.status = ONLINE
+                          └─ outbox row: identity.driver.online {...}
+   │
+   ▼  outbox relay (every 0.5 s, in main.py)
+RabbitMQ exchange "tesla.events"  (topic)
+   ├──▶ queue trip.driver-shift      (binds identity.driver.*)  → Trip's driver_shifts table
+   └──▶ queue matching.fleet-state   (binds identity.driver.*)  → Matching's "available drivers" set
+```
+
+| Routing key | When | `data` (exactly as in the Part 0.4 registry) |
+|---|---|---|
+| `identity.driver.online` | Jashim goes online (and wasn't already) | `driver_id`, `driver_name`, `vehicle_id`, `vehicle_nickname`, `plate`, `seat_capacity` |
+| `identity.driver.offline` | Jashim goes offline (and wasn't already) | `driver_id` |
+
+**Why the "online" event carries so much:** Trip needs Bullet's **seat capacity** to fill pools, and Matching and Notification show "Jashim in **Bullet**". Putting it all in the event means neither Trip nor Matching ever has to call Identity back (Part 0: calls only go *down* the chain). They keep their own copy, updated by these events.
+
+**Why through the outbox and not "publish directly":** covered in Part 1. The status change and the event are saved **together or not at all**. If RabbitMQ is down, the event waits in the `outbox` table and goes out once the broker is back. It's delayed, never lost (and this is now tested, see 3.6).
+
+### Why Identity consumes nothing
+
+Identity is at the **top** of the chain. Nothing that happens in Trip, Fare or Matching changes who a user is, what they drive, or whether they chose to work. (Trip's "busy / free" is Trip's own fact, 3.1.) So there is no queue, no consumer and no `processed_events` table in Identity.
+
+### Redis
+
+Only one command: `SET auth:revoked:{jti} 1 EX <remaining>` on logout (3.4). Identity is the **only writer** of these keys. The gateway (and later Notification) only **read** them (Part 2.3).
+
+### How 3.5 was checked
+
+`test_events_contract.py` (6 tests) runs Jashim through *vehicle → online → offline* and checks the outbox rows against the registry:
+- exactly two events, in order: `online`, then `offline`;
+- the `data` fields are **exactly** the registry's, with none missing and none extra, so a typo like `seats` instead of `seat_capacity` fails the test;
+- `seat_capacity` is a number (3), the rest are strings;
+- the envelope has exactly `event_id, event_type, occurred_at, producer, version, data`, with `event_type` = routing key, `producer = identity-service`, `version = 1`, a UTC `...Z` timestamp and a unique `event_id` per event;
+- both routing keys match the bindings of **both** consumer queues (`identity.driver.*`), using RabbitMQ's topic rule (`*` = exactly one word).
+
+Removing `plate` from the online event made 3 tests fail. The contract is really guarded.
+
+---
+
+## 3.6: the step-by-step guide
+
+| Step | Plan says | Where / status |
+|---|---|---|
+| 1 | `alembic init -t async migrations`; `env.py` with metadata, URL from settings, `render_as_batch=True` | **3.2** |
+| 2 | write `models.py`, autogenerate, review, `upgrade head` | **3.3** (plus the relationship fix) |
+| 3 | `scripts/gen_keys.sh`; only Identity mounts the private key | **done now**, see below |
+| 4 | `schemas.py`, `tokens.py`, `routers/auth.py` | **3.3 / 3.4** |
+| 5 | `routers/drivers.py`, `routers/internal.py` | **3.4** |
+| 6 | `main.py` lifespan: logging → bus → outbox relay → routers + health → clean shutdown | **done now** |
+| 7 | `seed.py`, idempotent, fixed UUIDs, password `Pool@1234` | **done now** |
+| 8 | tests: register/login, duplicate phone 409, passenger `/drivers/me/online` 403, vehicle edit while online 409 | **3.4** (all four), plus more now |
+
+### Step 3: the key pair
+
+Ran `sh scripts/gen_keys.sh`. `keys/` now holds:
+- `jwt_private.pem`: **Identity only** signs with it. Part 8's compose mounts the whole `keys/` folder only into Identity; every other service gets just the public key.
+- `jwt_public.pem`: the gateway and Notification verify with it.
+
+Checked: a token signed with the new private key verifies with the new public key. `keys/` is in `.gitignore` (confirmed with `git check-ignore`), so the private key **can't be committed**. If it ever leaks, run the script again: every existing token stops working and everyone simply logs in again.
+
+### Step 6: `main.py`
+
+```python
+lifespan:
+    configure_logging("identity")            # JSON logs (Part 1)
+    await bus.connect()                      # RabbitMQ; if it's unreachable, the service refuses to start
+    relay = create_task(run_outbox_relay(...))   # publishes outbox rows every 0.5 s (Part 1)
+    yield                                    # ── serving requests ──
+    stop.set(); wait up to 5 s for the relay # let the current batch finish
+    close bus, Trip client, Redis, database
+app: error format + /health + the three routers
+```
+
+- **`/health`** checks `db` (a `SELECT 1`), `rabbitmq` (connection open) and `redis` (`PING`). Anything failing → 503 `degraded`, naming the failed check. Docker uses this to know when Identity is ready, which matters because the gateway waits for it (Part 8).
+- **The bus lives in `deps.py`** next to `db`, as Trip's plan does, so every shared object is in one place.
+- **One small change from the plan's order ("set stop event, cancel task"):** cancelling *immediately* after `stop.set()` can cut the relay off mid-publish. Nothing would be lost (the row isn't marked, so it's re-sent after restart, and consumers drop duplicates, Part 1), but it causes needless duplicates on every restart. So the relay gets **up to 5 s to finish its batch**, and is cancelled only if it hangs.
+
+### Step 7: `seed.py`
+
+`python -m app.seed` (Docker runs it on every start, right after `alembic upgrade head`):
+
+| Name | Role | Phone | Id |
+|---|---|---|---|
+| Jashim | DRIVER (licence `DK-0001`) | 01711000001 | `11111111-1111-4111-8111-111111111111` |
+| Nusrat | PASSENGER | 01711000002 | `22222222-2222-4222-8222-222222222222` |
+| Rafiq | PASSENGER | 01711000003 | `33333333-3333-4333-8333-333333333333` |
+| Shirin | PASSENGER | 01711000004 | `44444444-4444-4444-8444-444444444444` |
+| **Bullet** | Jashim's Tesla Model 3, **3 seats**, plate `DHAKA-TESLA-11` | — | `b1111111-1111-4111-8111-111111111111` |
+
+Password for all: **`Pool@1234`**. Jashim starts **offline**. The demo begins with him tapping "Go online", which sends the event that Trip and Matching need.
+
+- **Idempotent** = safe to run again: anyone whose phone is already registered is skipped. The second run logs `seed done: nothing new`.
+- **Fixed ids** so the other services' seed data and test scripts can refer to "Nusrat" by the same id.
+- The plan doesn't give Jashim's licence number or Bullet's model; I picked `DK-0001` and `Model 3`.
+
+### Running the real commands
+
+Ran the container's start-up commands on a scratch database:
+
+| Command | Result |
+|---|---|
+| `alembic upgrade head` | `Running upgrade -> 0001, init` |
+| `python -m app.seed` | `seed done: Jashim, Nusrat, Rafiq, Shirin` |
+| `python -m app.seed` again | `seed done: nothing new` |
+| `uvicorn app.main:app` **with no RabbitMQ** | refuses to start (`AMQPConnectionError`), as intended: better not to start than to run without being able to publish events |
+
+**Not run: Identity against a real RabbitMQ.** Docker Desktop was off, and starting it also starts the other project's `mse-*` containers on the same ports (see `exp1.md`). The relay itself is Part 1 code, already tested against a real RabbitMQ in `check_events.py`. Everything Identity adds on top is tested below with a fake broker.
+
+### Tests: 94, all passing
+
+| File | Tests | Section |
+|---|---|---|
+| `test_migrations.py` | 3 | 3.3 |
+| `test_models.py` | 17 | 3.3 |
+| `test_schemas.py` | 21 | 3.3 |
+| `test_tokens.py` | 4 | 3.3 |
+| `test_auth_api.py` | 15 | 3.4 |
+| `test_drivers_api.py` | 17 | 3.4 |
+| `test_events_contract.py` | 6 | **3.5** (above) |
+| `test_main.py` | 6 | **3.6 step 6** |
+| `test_seed.py` | 5 | **3.6 step 7** |
+
+**`test_main.py`** runs the **real `app.main.app`** with its lifespan (the relay task really running), on a temp database, fakeredis and a **fake bus** that records what gets published:
+- Jashim registers → adds Bullet → goes online. The relay publishes `identity.driver.online` with Bullet's data **within seconds, by itself**, and marks the row `published_at`.
+- **Broker outage:** with the fake bus failing, the event is **not** published and the row stays unsent, so it isn't lost. When the "broker" comes back, it goes out automatically.
+- `/health` → 200 with `db`, `rabbitmq` and `redis` all `ok`; a closed broker connection → 503 naming `rabbitmq`.
+- All 9 endpoints + `/health` are mounted, and errors use the standard format.
+
+**`test_seed.py`**: creates exactly 4 users, 1 driver and 1 vehicle with the fixed ids; running it twice changes nothing; a phone someone already registered is skipped (their account untouched); Nusrat can log in with `Pool@1234`; seeded Jashim is offline with Bullet (3 seats).
+
+**Break-it checks** for the new parts: not starting the relay → 2 failed; seed not skipping existing phones → 2 failed; online event without `plate` → 3 failed. All caught, code restored.
 
 ---
 
 ## Things to know before the next sections
 
 - **Identity is built before Trip** (plan build order: step 2 vs step 5), but going offline calls Trip. Until Part 5 exists, the offline check can only be tested against a **fake Trip**, the same trick used for the gateway tests. In a real run before Trip exists, `POST /drivers/me/offline` will answer **503** (by design: fail closed).
-- **`main.py` is still a placeholder.** The endpoints exist and are tested, but the service can't be started with `uvicorn` until 3.6 step 6 wires up the app, RabbitMQ and the outbox relay.
+- **Running Identity for real needs RabbitMQ and Redis** (`docker compose up -d rabbitmq redis`, after stopping the `mse-*` containers). Without RabbitMQ it refuses to start, on purpose.
 - **No way to create an `ADMIN` yet.** The role exists, but registration only accepts `PASSENGER` or `DRIVER`, and the seed data has no admin. That's fine for now (nothing requires an admin); worth knowing if an admin tool is wanted later.
 - **A small known gap, from the plan itself:** between "Trip says Jashim has no pool" and "Jashim is marked offline", a few milliseconds pass in which he could still accept a new offer. Trip closes this as soon as it processes the `offline` event. The plan says to document it rather than fix it; explained in 3.4 ("Going offline").
 - **`argon2-cffi` and `alembic` are now installed** in `.venv` (3.2).
 - **The gateway's `config.py` doesn't read a local `.env`** the way Identity's now does (Part 8.3's "run a service outside Docker" needs it). It's a small fix, worth making before Part 8. It doesn't affect Docker, where `env_file: .env` provides the variables.
 - **Future migrations and unnamed UNIQUE rules:** the plan gives the CHECK rules names (`ck_user_role`...) but not the UNIQUE ones. That's fine now; if a later migration ever needs to *drop* one of those UNIQUE rules on SQLite, it will have to name it by hand.
-- **`keys/` is still empty.** Identity needs the **private** key to sign tokens: run `sh scripts/gen_keys.sh` before running it for real (3.6 step 3).
-- **Demo users** (from 3.6): Jashim, Nusrat, Rafiq and Shirin get **fixed ids** (e.g. Nusrat = `22222222-...`) so every service's seed data lines up. Password for all: `Pool@1234`.
+- **`keys/` now has the key pair** (3.6 step 3). It's gitignored; don't copy `jwt_private.pem` anywhere else.
+- **Demo users** (3.6 step 7): Jashim, Nusrat, Rafiq and Shirin, password `Pool@1234`, fixed ids. Other services' seeds (Fare wallets, etc.) should use the same ids.

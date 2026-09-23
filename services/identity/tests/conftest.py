@@ -94,9 +94,8 @@ def trip() -> FakeTrip:
 
 
 @pytest.fixture
-async def api(db, redis, trip, monkeypatch):
-    """The three routers on a test app, wired to the temp DB, fake Redis and fake Trip.
-    (main.py with the RabbitMQ bus and outbox relay is plan step 3.6.6.)"""
+async def wired(db, redis, trip, monkeypatch):
+    """Point the routers at the temp DB, fake Redis and fake Trip. Returns the fake-Trip ServiceClient."""
     client = ServiceClient("http://trip:8003", INTERNAL_TOKEN, "trip")
     client._client = httpx.AsyncClient(base_url="http://trip:8003", transport=httpx.MockTransport(trip),
                                        headers={"X-Internal-Token": INTERNAL_TOKEN})
@@ -104,14 +103,19 @@ async def api(db, redis, trip, monkeypatch):
         monkeypatch.setattr(module, "db", db)
     monkeypatch.setattr(auth_router, "redis", redis)
     monkeypatch.setattr(drivers_router, "trip_client", client)
+    yield client
+    await client.aclose()
 
+
+@pytest.fixture
+async def api(wired):
+    """The three routers on a bare test app (no RabbitMQ). test_main.py drives the real app.main.app."""
     app = FastAPI()
     install_error_handlers(app)
     for module in (auth_router, drivers_router, internal_router):
         app.include_router(module.router)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://identity") as c:
         yield c
-    await client.aclose()
 
 
 def as_user(user_id: str, role: str = "PASSENGER", name: str = "", **extra) -> dict:
