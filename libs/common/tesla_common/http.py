@@ -1,6 +1,7 @@
 import httpx
 
 from .errors import DomainError
+from .logging import current_request_id
 
 
 class ServiceClient:
@@ -13,6 +14,7 @@ class ServiceClient:
         )
 
     async def request(self, method: str, path: str, *, request_id: str | None = None, retries: int = 0, **kw) -> httpx.Response:
+        request_id = request_id or current_request_id()  # 8.6: the id travels even if a caller forgot to pass it
         headers = kw.pop("headers", {}) | ({"X-Request-Id": request_id} if request_id else {})
         attempts = retries + 1 if method == "GET" else 1
         last_exc: Exception | None = None

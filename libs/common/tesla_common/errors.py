@@ -3,6 +3,8 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from .logging import current_request_id
+
 
 class DomainError(Exception):
     def __init__(self, code: str, message: str, status: int = 400):
@@ -11,7 +13,8 @@ class DomainError(Exception):
 
 def _body(code: str, message: str, request: Request, details=None) -> dict:
     return {"error": {"code": code, "message": message,
-                      "request_id": request.headers.get("x-request-id"), "details": details}}
+                      "request_id": request.headers.get("x-request-id") or current_request_id(),
+                      "details": details}}
 
 
 def install_error_handlers(app: FastAPI) -> None:

@@ -8,11 +8,16 @@
 | 8.2 | Boot sequence (who starts when, and why) | **Done** (explained below) |
 | 8.3 | Local run (with and without Docker) | **Done** (explained below) |
 | 8.4 | End-to-end verification: the Banani story | **Done**: **52 of 52 checks pass on the real system**, three runs in a row |
-| 8.5 | Test plan (maps to the PRD) | Not started |
-| 8.6 | Observability minimum | Not started |
-| 8.7 | Known limitations & scale path | Not started |
+| 8.5 | Test plan (maps to the PRD) | **Done** (explained below) |
+| 8.6 | Observability minimum | **Done** (explained below) |
+| 8.7 | Known limitations & scale path | **Done** (explained below) |
 
-This file grows as each section gets done.
+**Part 8 is complete, and with it the whole plan.** Two commands check everything:
+
+```
+.venv\Scripts\python scripts\test_all.py     # every automated test (no Docker): 1,038 passed
+.venv\Scripts\python scripts\e2e.py          # the Banani story on the running system: 52 of 52
+```
 
 ---
 
@@ -255,9 +260,179 @@ Every arrow in the system was crossed **for real** at least once:
 
 ---
 
-## Things to know before the next sections
+## 8.5: the test plan
+
+The plan maps each **PRD requirement** to the test that proves it. All seven files it names were written in Parts 5 and 6. Here's each row, with the test that actually does it:
+
+| PRD requirement | Plan's test file | Plan's assertion | Where it is | Status |
+|---|---|---|---|---|
+| Bullet's capacity can never be exceeded | `trip/tests/test_capacity.py` | a direct `UPDATE … occupied_seats = 4` raises `IntegrityError`; `try_join` with 2 seats on 2/3 → `STALE`, seats stay 2 | `test_direct_overbooking_is_refused_by_the_database`, `test_two_seats_do_not_fit_in_one` | ✅ as written, plus "seats always equal the riders booked" after every step of a whole evening |
+| Two concurrent requests can't corrupt capacity | `trip/tests/test_concurrency.py` | the plan's code: Nusrat and Shirin race for the last seat → one `joined`, one `stale`, 3 of 3 | `test_last_seat_goes_to_exactly_one_rider` | ✅ the plan's test, plus 10 riders racing for 1 seat, and 2 drivers accepting the same ride |
+| Invalid transitions rejected | `trip/tests/test_state_machine.py` | all 36 pairs × 3 actors | `test_transition` (108 cases), `test_the_grid_is_complete` | ✅ |
+| Pooled fares correct | `fare/tests/test_pricing.py` | 7200 / 5400 / 8250 | `test_nusrat_pooled_banani_to_mohakhali`, `test_rafiq_pooled_banani_to_gulshan_1`, `test_nusrat_alone` | ✅ and the real system gives the same numbers (8.4, step 10) |
+| Users can't modify another's ride | `trip/tests/test_ownership.py` | Rafiq cancelling Nusrat's ride → 404; Jashim acting on a ride not in his pool → 404 | `test_rafiq_cannot_cancel_nusrats_ride`, `test_another_driver_cannot_touch_jashims_riders`, and through HTTP: `test_http_rafiq_cannot_see_or_cancel_nusrats_ride`, `test_http_other_driver_gets_404_on_every_move` | ✅ |
+| Cancellation rules | `trip/tests/test_lifecycle.py` | passenger cancel in `DRIVER_ARRIVED` → 409; cancel in `MATCHED` frees the seat and removes the stops | `test_passenger_cannot_cancel_after_driver_arrived`, `test_cancel_in_matched_frees_the_seat_and_the_stops` | ✅ |
+| Idempotent settlement | `fare/tests/test_settlement.py` | same event twice → one fare, one debit | `test_same_event_twice_one_fare_one_debit` | ✅ plus two **different** events for one ride, and 5 racing copies |
+
+**The race tests, 50 times** (the plan: "run `--count 50` to shake out flakiness"): `150 passed` (3 race tests × 50), again today, with no flakes.
+
+**One difference from the plan's note:** it says the concurrency test's database is made with `Base.metadata.create_all`. Ours is made by **running the real migrations** (every test in every service does that). So the race is tested against exactly the tables production has, including the partial unique indexes and CHECK rules that `create_all` and the migrations could, in principle, disagree on.
+
+### One command for everything: `scripts/test_all.py`
+
+Every service's tests, plus the shared library's (new in 8.6), plus optionally the race repeat:
+
+```
+.venv\Scripts\python scripts\test_all.py --race 50
+```
+```
+ok    libs/common                                11 passed
+ok    services/gateway                           65 passed
+ok    services/identity                          94 passed
+ok    services/matching                          127 passed
+ok    services/trip                              341 passed
+ok    services/fare                              151 passed
+ok    services/notification                      99 passed
+ok    services/trip (race x50)                   150 passed
+
+1038 tests passed
+```
+
+No Docker needed: each suite fakes what it doesn't own. The **real** system is checked by `scripts/e2e.py` (8.4). Between them, every PRD requirement is tested both **in isolation** (fast, every edge case) and **for real** (slow, the whole path).
+
+---
+
+## 8.6: observability
+
+The plan asks for three things. The first was only half there; the other two are now checked for real.
+
+### 1. "JSON logs with `request_id`": now true for every line
+
+**What existed:** the gateway created a request id and passed it on in the `X-Request-Id` header, services passed it on to their own outgoing calls, and error answers included it. **What was missing:** no log line ever **carried** it. Part 1's JSON formatter could print a `request_id`, but only if each log call passed one, and none did. Uvicorn's own lines weren't even JSON. So you couldn't follow a request through the logs, which is the whole point.
+
+**What I added**, all in Part 1's shared library, so every service got it by adding one line to its `main.py`:
+
+| Piece | What it does |
+|---|---|
+| a **request context** (`RequestContextMiddleware`) | keeps the request's id for the whole request (from `X-Request-Id`, or new), and returns it in the response |
+| `ContextFilter` | stamps that id onto **every** log line written during the request, from any code, without passing it around |
+| **one access line** per request | `{"logger": "access", "msg": "POST /rides 201 121.7ms", "method", "path", "status", "duration_ms", "request_id"}`. The path is logged **without** its query string (it can hold secrets). `/health` lines go to DEBUG, because Docker asks every 5 s |
+| uvicorn's lines | through the same JSON formatter; its plain-text access line is switched off (the new one replaces it) |
+| outgoing calls | `ServiceClient` sends the current id even if a caller forgot to pass it |
+| error answers | `error.request_id` is filled even when the id was made by this service |
+| the bus | while an **event** is handled, every log line carries its **`event_id`** (both the durable and the per-copy queues) |
+
+The gateway now uses the middleware's id instead of making its own, so the id in the gateway's logs, the response header, and every downstream service is the same one.
+
+**Checked on the real system.** Rafiq requested a ride with `X-Request-Id: trace-8-6-demo`; then every log line of every service carrying that id:
+
+```
+trip-service  httpx   HTTP Request: POST http://fare:8004/internal/quotes "HTTP/1.1 201 Created"
+trip-service  httpx   HTTP Request: POST http://matching:8002/internal/match/evaluate "HTTP/1.1 200 OK"
+trip-service  access  POST /rides 201 121.7ms
+matching      access  POST /internal/match/evaluate 200 7.1ms
+fare          access  POST /internal/quotes 201 13.4ms
+gateway       httpx   HTTP Request: POST http://trip:8003/rides "HTTP/1.1 201 Created"
+gateway       access  POST /api/v1/rides 201 127.5ms
+```
+
+**One tap, four services, one id, with timings.** (No Fare → Matching line: that distance was still in Fare's 24-hour cache, which is correct.)
+
+**Tested** in `libs/common/tests/test_observability.py` (11 tests, the shared library's first pytest suite):
+- the gateway's id is kept, returned, and on a log line written deep inside the endpoint;
+- a new id is made when none came in, the same one inside and outside;
+- one JSON access line per request; **no query string in it**;
+- errors carry the id in the body, the header and the log;
+- health checks are quiet;
+- WebSockets pass through untouched;
+- **the id doesn't leak into the next request**;
+- **outgoing calls carry it** without being told;
+- event handlers log with the `event_id`;
+- uvicorn's lines are JSON and its duplicate access line is gone.
+
+All 877 service tests still pass with the change.
+
+### 2. `/health` on every service
+
+Done in Parts 2–7: database + RabbitMQ (+ Redis where used), 503 naming what's down. In Part 8 they drive Compose's boot order, and the gateway's `/health` checks all the others (8.1).
+
+### 3. The alert-worthy signals: `scripts/alerts.py`
+
+The plan names three. The script checks all three against the running system, prints `ok` / `ALERT`, and exits 1 on any alert, so a scheduler can run it every minute:
+
+| Signal | Means | How it's checked |
+|---|---|---|
+| a **dead-letter queue** has messages | an event failed 3 retries and is parked; someone must look | RabbitMQ's API |
+| an **outbox row unpublished > 30 s** | a service can't reach RabbitMQ; its news isn't going out | the outbox tables in Trip, Fare and Identity |
+| a **`RATE_LIMITED` spike** | someone is hammering the API | the gateway's new access lines with status 429, last 5 minutes (threshold 20, adjustable) |
+
+If a check **can't run** (RabbitMQ unreachable), that's reported as an alert too: silence must never look like "all fine".
+
+**Each alert was made to fire for real:**
+
+| Alert | How it was triggered | Result |
+|---|---|---|
+| dead-letter queue | **by accident, which was the best test**: I'd run Part 1's `check_events.py` against this stack's RabbitMQ. It publishes a fake `trip.ride.completed` (no quote) on the **real** exchange; Fare couldn't settle it, retried 3 times, and parked it | `ALERT fare.ride-lifecycle.dlq: 2 parked event(s)`. Read the parked messages (`error: 'quote_id'`, `attempt 4`), traced them to the check script, cleared them. That script now warns at the top not to run it against a live stack |
+| rate limiting | 70 location pings from Jashim in a row (the limit is 60/min) | **exactly 60 accepted, 10 refused with 429**; `ALERT gateway: 10 RATE_LIMITED (429) in the last 5m` (with the threshold lowered to 5 for the demo) |
+| stuck outbox | **stopped RabbitMQ**, had Jashim go online, waited 35 s | going online **still worked** (the change and its event were saved together); `ALERT identity: 1 event(s) unpublished for over 30 s`, and the dead-letter check reported that it couldn't check |
+
+**Then RabbitMQ was started again**, which also tests one of 8.7's claims: the waiting event was published **14 s later on its own**, Trip received it with its **original** time (it says Jashim went online at 19:34:57, during the outage), **no service restarted** (they all reconnected by themselves), and the alerts went back to `ok`.
+
+---
+
+## 8.7: known limitations, and the way to scale
+
+### The plan's table, checked against what was built
+
+| Limitation now | Why it's fine for now | At 1M riders / 100k drivers | Checked here |
+|---|---|---|---|
+| **SQLite**: one container per service, one writer per database | correctness is simple and provable | Trip/Fare → PostgreSQL; the same `UPDATE … WHERE` compare-and-set works under row locks | the race tests (1 seat, 10 riders; 2 drivers, 1 ride) pass 50 times in a row (8.5) |
+| **same-pickup-zone** pooling | a rule you can check by hand | nearby-cell pickups (H3), insertion over real travel times | the 140 % rule and the stop order are hand-checked in 4.4; Rafiq joins with G1 before M on the real system (8.4) |
+| a driver accepts only the **first** rider | fewer round trips | a confirm window per rider, if drivers want it | Rafiq joins Bullet with no tap from Jashim (8.4, step 5) |
+| a `REQUESTED` ride nobody accepts is **cancelled, not re-matched** | simple, visible | the sweeper asks Matching again before giving up | Shirin's 2-seat request stays `REQUESTED` with **no** driver offered (8.4, step 6) |
+| the WebSocket has **its own port** | no WebSocket proxying in the gateway | one entry point (Traefik / Nginx) for TLS and upgrades | 8005 published beside 8000 (8.1) |
+| **one Redis** | losing it only loses short-lived state | Redis Cluster, geo keys by region | see below: one more thing Redis holds |
+| **one RabbitMQ** | the outbox means no event is lost if the broker restarts | quorum queues, 3 nodes | **proven on the real system** (8.6): RabbitMQ stopped, an event made meanwhile, published 14 s after restart, no restarts |
+
+### Two more, found while running it
+
+| Limitation | What happens | What to do |
+|---|---|---|
+| **RabbitMQ has no volume** in the compose file (the plan's, too) | `docker compose stop` keeps its data, but `docker compose down` **deletes** it. An event already **published** (so no longer in any outbox) but not yet **consumed** would be lost. The outbox only protects events that haven't left yet | give RabbitMQ a named volume (`/var/lib/rabbitmq`), or at least use `stop`, not `down`, while there's traffic |
+| **Redis holds the "logged out" list** (Parts 2, 3, 7) | if Redis's data is lost (`docker compose down` deletes it, since Redis has no volume either; or a crash between its periodic snapshots), **logged-out tokens become valid again** until they expire (up to 1 hour). The plan's "loss only affects ephemeral state" is true for positions and rate counters, but not for this | acceptable with 1-hour tokens for an MVP. At scale: Redis persistence (AOF) for that key, or short tokens + refresh |
+
+### Limitations found in earlier parts (all documented where they were found)
+
+| Where | Limitation | Why it's fine for now |
+|---|---|---|
+| Trip (5.5) | a rider is offered only to drivers near **at request time**; a driver who comes online a minute later never sees her | the plan's "cancelled, not re-matched" row above |
+| Trip (5.5) | "pooled" is decided when **each** ride completes, so a rider can pay the pooled price if her co-rider no-shows after she's dropped | rare with same-zone pickups (both are picked up before anyone is dropped) |
+| Trip (5.7) | if a driver's very first "online" is delayed and his "offline" arrives first, Trip thinks he's online | only affects accepting offers, and offers come from Matching, which handles it |
+| Fare (6.5) | a double-tapped top-up adds money twice unless the app sends an `Idempotency-Key` | simulated money; the gateway supports the key on every `POST` |
+| Notification (7.3) | inbox ids come from SQLite's rowid; deleting the **newest** rows could make a catch-up skip a message | nothing deletes inbox rows; a clean-up job should delete old ones only |
+| Notification (7.4) | one person's sockets are sent to one after another; a very slow phone delays their others | at scale: a small send queue per socket |
+| Matching (4.x) | Fare caches distances for 24 h; changing a distance override needs `fare:dist:*` cleared | overrides are set by migration, rarely |
+
+---
+
+## Everything changed from the plan in Part 8, in one place
+
+| Where | Change | Section |
+|---|---|---|
+| `docker-compose.yml` | RabbitMQ healthcheck `check_port_connectivity` (not `ping`); host ports as settings; a gateway healthcheck; no unused `PORT` | 8.1 |
+| `scripts/e2e.py` | the plan's `e2e.sh` story in Python, **checking** every step, plus the live-channel and post-run checks; a GPS ping during the ride; tidy-up | 8.4 |
+| Part 1 `logging.py`, `errors.py`, `http.py`, `events.py` + each service's `main.py` | request/event id on every log line, JSON access lines, JSON uvicorn lines, the id passed on automatically | 8.6 |
+| `scripts/alerts.py` | the plan's three alert signals, checked | 8.6 |
+| `scripts/test_all.py` | every suite in one command | 8.5 |
+| `libs/common/tests/`, `pytest.ini` | the shared library's first pytest suite | 8.6 |
+| `libs/common/checks/check_events.py` | a warning not to run it against the live stack | 8.6 |
+
+---
+
+## Things to know
 
 - **The system is left running** on this machine, on the moved ports (gateway `http://localhost:18000`, WebSocket `ws://localhost:18005`, RabbitMQ UI `http://localhost:35672`). Stop it with `docker compose down` (add `-v` to wipe the data). Remember the other project (`mse-*`) holds the default ports while it's running.
 - **Reset to a clean slate:** `docker compose down -v && docker compose up -d`. The e2e script can also just be run again: it tidies up after itself.
 - **Wallets go down with every run** (Nusrat pays ৳72 each time; she starts with ৳500), so after ~6 runs on the same data her wallet payment would come back **FAILED** (step 10 would fail, correctly). `down -v` resets them.
-- **8.5 (the test plan)** maps the PRD's requirements to test files. All seven files it names already exist (written in Parts 5 and 6); 8.5 will check that each one really asserts what the plan's table says.
+- **To check the system after any change:** `scripts/test_all.py` (fast, no Docker), then `docker compose up --build -d` and `scripts/e2e.py`, then `scripts/alerts.py`.
+- **To follow one request through the logs:** send it with `X-Request-Id: <something>` (or read the id from the response header), then `docker compose logs --no-log-prefix | grep '"request_id": "<something>"'`.

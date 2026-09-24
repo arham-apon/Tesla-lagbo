@@ -9,8 +9,7 @@ from redis.exceptions import RedisError
 
 from tesla_common.errors import DomainError, install_error_handlers
 from tesla_common.health import health_router
-from tesla_common.logging import configure_logging
-from tesla_common.timeutil import new_id
+from tesla_common.logging import configure_logging, current_request_id, install_request_context
 
 from . import idempotency, ratelimit
 from .config import settings
@@ -33,13 +32,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Tesla Pool Gateway", lifespan=lifespan)
 install_error_handlers(app)
+install_request_context(app)  # 8.6: request id in every log line
 
 
 @app.exception_handler(RedisError)
 async def _redis_down(request: Request, exc: RedisError):
     # Fail closed: without Redis we cannot check revocations, rate limits or idempotency keys.
     return JSONResponse({"error": {"code": "DEPENDENCY_UNAVAILABLE", "message": "Redis unavailable",
-                                   "request_id": request.headers.get("x-request-id"), "details": None}},
+                                   "request_id": current_request_id(), "details": None}},
                         status_code=503)
 
 
@@ -73,7 +73,7 @@ async def proxy(request: Request, path: str):
     route = match(st.routes, full_path)
     if route is None:
         raise DomainError("NOT_FOUND", "No such route", 404)
-    request_id = request.headers.get("x-request-id") or new_id()
+    request_id = current_request_id()  # set by the request-context middleware (from the phone, or new)
     principal, claims = (None, None) if route.public else await authenticate(request, st.redis, st.public_key)
     client_id = principal.user_id if principal else (request.client.host if request.client else "anon")
     await ratelimit.enforce(st.redis, f"{route.prefix}:{client_id}", route.rate_per_min)

@@ -1,7 +1,10 @@
 """Step 1.4.4 — prove retry + DLQ and the outbox relay against a real RabbitMQ.
 
-Needs RabbitMQ:  docker compose up -d rabbitmq
+Needs RabbitMQ:  docker compose up -d rabbitmq      (ONLY RabbitMQ: not the full stack)
 Run:             python libs/common/checks/check_events.py
+
+Don't run this while the services are up: it publishes a fake `trip.ride.completed` on the real exchange, so Fare
+receives it too, can't settle it (no quote), and parks it in fare.ride-lifecycle.dlq (seen in Part 8.6).
 
 Part 1: a handler that always raises. Expected: 1 try + 3 retries (each ~5 s apart,
         via `<queue>.retry`), then the message is parked in `<queue>.dlq`.

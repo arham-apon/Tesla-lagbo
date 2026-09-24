@@ -11,6 +11,7 @@ from sqlalchemy import DateTime, Integer, String, Text, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import Mapped, mapped_column
 
+from .logging import event_id_var
 from .timeutil import new_id, utcnow
 
 log = logging.getLogger("tesla.events")
@@ -101,14 +102,17 @@ class Bus:
             except json.JSONDecodeError:
                 await self._reroute(msg, f"{queue_name}.dlq", attempt=0, error="invalid JSON")
                 return
+            token = event_id_var.set(envelope.get("event_id"))  # 8.6: every log line in the handler has it
             try:
                 await handler(envelope)
                 await msg.ack()
             except Exception as exc:
                 attempt = int((msg.headers or {}).get("x-attempt", 0)) + 1
                 target = f"{queue_name}.retry" if attempt <= max_retries else f"{queue_name}.dlq"
-                log.exception("handler failed", extra={"event_id": envelope.get("event_id")})
+                log.exception("handler failed")
                 await self._reroute(msg, target, attempt=attempt, error=str(exc))
+            finally:
+                event_id_var.reset(token)
 
         await queue.consume(on_message)
 
@@ -119,7 +123,12 @@ class Bus:
 
         async def on_message(msg: AbstractIncomingMessage) -> None:
             async with msg.process(requeue=False):
-                await handler(json.loads(msg.body))
+                envelope = json.loads(msg.body)
+                token = event_id_var.set(envelope.get("event_id"))
+                try:
+                    await handler(envelope)
+                finally:
+                    event_id_var.reset(token)
 
         await queue.consume(on_message)
 

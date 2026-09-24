@@ -8,7 +8,7 @@ from sqlalchemy.exc import OperationalError
 from tesla_common.errors import install_error_handlers
 from tesla_common.events import run_outbox_relay
 from tesla_common.health import health_router
-from tesla_common.logging import configure_logging
+from tesla_common.logging import configure_logging, install_request_context
 
 from . import settlement
 from .deps import bus, db, matching_http, redis, settings
@@ -62,6 +62,7 @@ async def _rabbitmq_check() -> None:
 
 app = FastAPI(title="Fare & Billing Service", lifespan=lifespan)
 install_error_handlers(app)
+install_request_context(app)  # 8.6: request id in every log line
 app.include_router(fares.router)
 app.include_router(wallet.router)
 app.include_router(driver.router)

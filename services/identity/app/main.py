@@ -7,7 +7,7 @@ from sqlalchemy import text
 from tesla_common.errors import install_error_handlers
 from tesla_common.events import run_outbox_relay
 from tesla_common.health import health_router
-from tesla_common.logging import configure_logging
+from tesla_common.logging import configure_logging, install_request_context
 
 from .config import settings
 from .deps import bus, db, redis, trip_client
@@ -48,6 +48,7 @@ async def _redis_check() -> None:
 
 app = FastAPI(title="Tesla Pool Identity", lifespan=lifespan)
 install_error_handlers(app)
+install_request_context(app)  # 8.6: request id in every log line
 app.include_router(health_router({"db": _db_check, "rabbitmq": _rabbitmq_check, "redis": _redis_check}))
 app.include_router(auth.router)
 app.include_router(drivers.router)
