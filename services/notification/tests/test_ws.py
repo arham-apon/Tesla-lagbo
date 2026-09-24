@@ -150,10 +150,10 @@ async def test_logging_out_closes_an_open_socket(server, make_token):
 
 
 async def test_an_expiring_token_closes_the_socket(server, make_token):
-    async with websockets.connect(f"{server.url}/ws?token={make_token(ttl=1.0)}") as c:
+    async with websockets.connect(f"{server.url}/ws?token={make_token(ttl=2.5)}") as c:
         await c.send("ping")
         assert await c.recv() == "pong"
-        assert await closed_with(c) == 4401  # about a second later, on its own
+        assert await closed_with(c) == 4401  # a couple of seconds later, on its own
 
 
 # ---- finding 2: the token never reaches the log -----------------------------------------------------------------

@@ -9,10 +9,15 @@
 | 7.3 | Data layer (the inbox) | **Done** (explained below) |
 | 7.4 | Recipient rules (who hears about what) + connections | **Done** (explained below) |
 | 7.5 | API endpoints (WebSocket + inbox) | **Done** (explained below) |
-| 7.6 | Messaging (inbox queue, broadcast queue, live location) | Not started |
-| 7.7 | Step-by-step build + tests | Not started |
+| 7.6 | Messaging (inbox queue, broadcast queue, live location) | **Done** (explained below) |
+| 7.7 | Step-by-step build + tests | **Done** (explained below) |
 
-This file grows as each section gets done.
+**Part 7 is complete.** Notification is written and covered by 99 automated tests, all passing. Run them with:
+
+```
+cd services\notification
+..\..\.venv\Scripts\python -m pytest
+```
 
 ---
 
@@ -137,7 +142,7 @@ Like 5.1 and 6.1, this is a **scope definition** with no code of its own. I chec
 
 **2. The token travels in the URL (7.5).** `/ws?token=…` is the usual way (a browser can't add headers to a WebSocket), but URLs end up in **access logs**. Uvicorn's log line includes the query string (checked in its source: it logs `"WebSocket /ws?token=…" [accepted]` using the path **with** the query), so every login token would be written to Notification's log. **Proposed:** keep the query parameter, but make sure the access log doesn't print it. *Fixed in 7.5 (the filter; it's switched on at startup in 7.7).*
 
-**3. A Redis hiccup can lose a pool's member list (7.6).** In the plan's `persist`, the inbox rows **and the "already processed" mark** are committed first, and **then** the Redis member set is written. If Redis fails at that moment, the event is retried, but the retry sees "already processed" and stops, so the member list is **never** written. Nusrat wouldn't see the car moving until the next pool change. **Proposed:** the member-set write is a full replacement, so it's safe to repeat. Do it even when the event was already processed.
+**3. A Redis hiccup can lose a pool's member list (7.6).** In the plan's `persist`, the inbox rows **and the "already processed" mark** are committed first, and **then** the Redis member set is written. If Redis fails at that moment, the event is retried, but the retry sees "already processed" and stops, so the member list is **never** written. Nusrat wouldn't see the car moving until the next pool change. **Proposed:** the member-set write is a full replacement, so it's safe to repeat. Do it even when the event was already processed. *Fixed in 7.6, a slightly different way: the write now happens before the commit (see 7.6).*
 
 **4. `ride.matched` is sent to the passenger as-is (7.4).** It contains `driver_id` and `joined_existing_pool` besides the driver's name and car. Nothing secret, and no co-rider data, but the plan's privacy column only promises "driver name + Bullet". I'll decide in 7.4 whether to trim it, and test that no co-rider id ever reaches a passenger. *Decided in 7.4: every message is now an allowlist of named fields (see 7.4).*
 
@@ -166,9 +171,9 @@ services/notification/
 │   ├── models.py               the inbox (7.3)
 │   ├── routing.py              recipients(event) (7.4)
 │   ├── connections.py          open sockets per user (7.4)
-│   ├── consumers.py            placeholder: persist + push, code in 7.6
-│   ├── live_location.py        placeholder: loc:pool:* relay, code in 7.6
-│   ├── main.py                 placeholder: app + lifespan, code in 7.7
+│   ├── consumers.py            persist + push (7.6)
+│   ├── live_location.py        loc:pool:* relay (7.6)
+│   ├── main.py                 app + lifespan (7.7)
 │   └── routers/
 │       ├── __init__.py
 │       ├── ws.py               WS /ws (7.5)
@@ -402,9 +407,169 @@ Confirmed on a real server: uvicorn logs every socket as `"WebSocket /ws?token=e
 
 ---
 
-## Things to know before the next sections
+## 7.6: messaging (`consumers.py`, `live_location.py`)
+
+### One event, two queues
+
+RabbitMQ gives Notification **two copies** of every `trip.ride.*`, `trip.pool.updated` and `fare.ride.settled` (the plan's bindings):
+
+| | `persist` on **`notification.inbox`** | `push` on a **broadcast** queue |
+|---|---|---|
+| does | saves each routed message to the inbox (7.3), one row per person | sends each routed message to the sockets **this copy** holds (7.4) |
+| queue | durable, shared: with 2 copies running, **one** of them saves it | one per copy, deleted when that copy stops: **every** copy pushes |
+| if it fails | retried 3 times, then parked in the dead-letter queue | dropped: the inbox has it, and the phone catches up |
+| twice | saved once (`processed_events`, in the same transaction) | the phone may get it twice; the `event_id` in the message lets the app ignore the repeat |
+
+Both use the **same** `recipients()` (7.4), so what's saved is exactly what was pushed. A test checks that the live messages Nusrat received and her inbox are identical.
+
+**Pool updates aren't saved** (the plan's rule). They're frequent, they're for the driver only, and his app can always ask Trip for the current pool (`GET /driver/pool`, 5.6).
+
+### Who may see the car move
+
+On every `trip.pool.updated`, `persist` also rewrites a small Redis set: `notif:pool:{pool_id}:members` = the pool's current passengers, but **only while the pool is live** (`FORMING` / `IN_PROGRESS`). When the pool finishes, the set is emptied. The set expires by itself after 6 hours, in case a "finished" event is ever lost.
+
+### The change: the member list can't be lost any more (finding 3)
+
+| Plan's code | Problem | Fix |
+|---|---|---|
+| the inbox rows **and the "processed" mark** were committed, **then** the Redis set was written | if Redis blipped at that moment, the retry saw "already processed" and stopped: the member list was **never** written, and nobody in the pool saw the car move until the next pool change | the Redis write happens **inside** the transaction, **before** the commit. A Redis error rolls **everything** back (inbox rows and "processed" mark), and the retry does it all again. The write replaces the whole set, so repeating it is harmless |
+
+A test makes Redis fail once: the first delivery raises and leaves no "processed" mark; the retry writes the list.
+
+### `live_location.py`: Jashim's GPS to his passengers
+
+Matching publishes each ping on `loc:pool:{pool_id}` (4.5). The relay listens to **all** of them (`PSUBSCRIBE loc:pool:*`), looks up that pool's member set, and sends each member `{"type": "vehicle.location", "data": {lat, lng, zone, ts}}`. That's the car's position and nothing else: **not the driver's id**, and nothing about the other passengers.
+
+**Two changes from the plan:**
+
+| Plan's code | Problem | Fix |
+|---|---|---|
+| one `try` around the whole loop; any error → log "crashed" and **exit** | **one** malformed message (not JSON, a missing field) **ended the relay for good**: no moving cars for anyone until Notification was restarted | a bad message is **skipped** (logged as a warning), and the loop carries on |
+| same | a Redis hiccup also ended it for good | on a Redis error it logs, waits 1 s, and **subscribes again** |
+
+### How 7.6 was checked: 23 tests
+
+**`test_consumers.py` (14)**, with the evening's events from 7.4's tests:
+- each recipient gets an inbox row; **the saved payload is exactly the routed message**; pool updates aren't saved; the same event twice is saved once; a whole evening leaves each person the right inbox;
+- the member list **follows the pool** (1 → 2 passengers → Nusrat dropped off) and expires; **a completed or cancelled pool has no members**;
+- **a Redis blip doesn't lose the member list** (finding 3, above); events that don't touch Redis aren't affected by it; a broken event raises and leaves nothing (so the bus retries it);
+- push reaches open sockets (the driver's copy of the fare is trimmed, 7.4); nobody online is fine;
+- both queues are declared with the plan's bindings.
+
+**`test_live_location.py` (9)**, with fakeredis's real Pub/Sub and exactly Matching's message:
+- **the pool's passengers see the car**, **nobody else does, and no driver id is sent**; another pool's position goes to its own passengers; a finished pool reaches nobody;
+- **3 kinds of bad message are skipped and the relay keeps going**; it stops when asked; **it survives Redis trouble** by re-subscribing.
+
+---
+
+## 7.7: the step-by-step guide, finished
+
+| Plan step | Where | Evidence |
+|---|---|---|
+| 1. models + migration | 7.3 | `test_migrations.py`, `test_models.py` |
+| 2. `routing.py` with a test per event type, incl. "Rafiq never receives a message containing Nusrat's fare" | 7.4 | `test_routing.py` has both |
+| 3. `connections.py`, `routers/ws.py` (plan: test with `TestClient.websocket_connect`) | 7.4, 7.5 | `test_connections.py`; `test_ws.py` uses a **real uvicorn server** instead, because the test client hides the 403-vs-4401 difference (7.5) |
+| 4. `consumers.py`, `live_location.py` | 7.6 | `test_consumers.py`, `test_live_location.py` |
+| 5. `routers/inbox.py` | 7.5 | `test_inbox.py` |
+| 6. lifespan: bus → consumers → location relay | **now** | `test_main.py` |
+
+### `main.py`: startup and shutdown
+
+**Startup:** JSON logging as `notification` → **switch on the token-redaction filter** for uvicorn's logs (7.5) → **check the inbox tables exist and Identity's public key can be read** (added) → connect to RabbitMQ → start both queues → start the location relay.
+
+**Shutdown:** stop the relay (and wait), close RabbitMQ, Redis and the database, and switch the redaction filter off again. That last step also runs **when startup is refused**; see "a leak found by the tests" below.
+
+**`/health`** checks the database, Redis and RabbitMQ, and answers 503 naming the one that's down.
+
+### Changes to the plan's lifespan
+
+| Plan says | What I did | Why |
+|---|---|---|
+| "bus → consumers → relay" | the same, plus the checks below | |
+| (no startup checks) | **refuse to start** without the inbox tables, and **without a readable public key** | without the key, Notification would start "healthy" and then **every** phone's login check would fail. Better to say so at startup: `can't read JWT_PUBLIC_KEY_PATH=…` |
+| (the log leak, 7.5) | the redaction filter is added at startup and removed at shutdown | tokens in `/ws?token=…` never reach the log |
+
+### A leak found by the tests
+
+The full test run failed where each file passed on its own. The cause: startup added the redaction filter to uvicorn's logger **for the whole process**, and a test that makes startup **refuse** (no tables) never reached the code that removes it. A later test that needs the **unfiltered** log then saw `token=***`. In production it's harmless (a refused start ends the process), but it was sloppy. The filter is now removed in a `finally`, so it's removed whether startup succeeds or not. Three full runs in a row: 99 passed.
+
+### Checked for real (no Docker)
+
+| Command | Result |
+|---|---|
+| `uvicorn app.main:app` on an empty database | `RuntimeError: notification.db has no tables: run alembic upgrade head first`, as intended |
+| `alembic upgrade head` | `-> 0001, init` |
+| `uvicorn` with a missing key file | `RuntimeError: can't read JWT_PUBLIC_KEY_PATH=…/missing.pem`, as intended |
+| `uvicorn` with the key, but no RabbitMQ | JSON log (`"service": "notification"`), `AMQPConnectionError`, startup failed, as intended |
+
+(Alembic also needs `JWT_PUBLIC_KEY_PATH` set, because the settings require it. In Docker it comes from `.env`, where `.env.example` already sets `/run/keys/jwt_public.pem`, and the compose file mounts that key.)
+
+As with the other services, **Notification against a real RabbitMQ and Redis wasn't run** (Docker is off). Its WebSocket **was** run on a real server (7.5).
+
+### How 7.7 was checked: 10 tests (`test_main.py`)
+
+The **real `app.main.app`** with its lifespan, a fake bus that records **both** queues, fakeredis, and fake sockets:
+- startup declares both queues with the plan's bindings; the inbox routes, `/ws` and `/health` are mounted; health 200 → 503 when the broker goes; **the redaction filter is on**;
+- **the evening, end to end**: Nusrat's phone is open, Rafiq's is off; every event goes through **both** queues as RabbitMQ would deliver it:
+  - Nusrat's phone gets her 4 messages live, and Jashim's gets his 4 pool updates;
+  - **Rafiq catches up from the inbox** with exactly his 4 messages, ending with his ৳54, and only about his own ride;
+  - **Nusrat's inbox is identical to what she got live**;
+- **the car moves on Nusrat's map**: her pool update, then a GPS ping on Redis → she gets `vehicle.location` with lat, lng, zone, time and nothing else;
+- a redelivered event is saved once;
+- shutdown stops the relay and closes the bus;
+- **refuses to start** without tables, and without the public key.
+
+**Break-it checks for 7.6 and 7.7:**
+
+| Deliberately broke... | Result |
+|---|---|
+| **the plan's order**: member list written after the commit (finding 3) | 1 failed |
+| no dedupe | 2 failed |
+| pool updates saved to the inbox too | 1 failed |
+| a finished pool keeps its members | 2 failed |
+| broadcast queue not started | 5 failed |
+| relay forwards the driver id | 3 failed |
+| **the plan's relay**: a bad message ends it | 3 failed |
+| relay ends on a Redis error | 1 failed |
+| relay not started | **the run hung** (a test waited forever for the relay to subscribe) → gave that wait a 2 s limit → now 2 fail |
+| redaction filter not switched on | 1 failed |
+| key not checked at startup | 1 failed |
+
+### Part 7 in numbers: 99 tests, all passing
+
+| File | Tests | Section |
+|---|---|---|
+| `test_migrations.py` | 5 | 7.3 |
+| `test_models.py` | 8 | 7.3 |
+| `test_routing.py` | 20 | 7.4 |
+| `test_connections.py` | 6 | 7.4 |
+| `test_ws.py` | 15 | 7.5 |
+| `test_inbox.py` | 12 | 7.5 |
+| `test_consumers.py` | 14 | **7.6** |
+| `test_live_location.py` | 9 | **7.6** |
+| `test_main.py` | 10 | **7.7** |
+
+### Everything changed from the plan in Part 7, in one place
+
+| Where | Change | Section |
+|---|---|---|
+| `models.py` | payload must be valid JSON; a message needs a person | 7.3 |
+| `routing.py` | every recipient gets an **allowlist** of fields, not the whole event; no quote id to passengers; the driver's fare copy trimmed | 7.4 |
+| `routers/ws.py` | accept **before** closing with 4401 (else a bare 403); login re-checked while open (expiry + logout); binary frames ignored; missing token → 4401 | 7.5 |
+| `routers/ws.py` + `main.py` | login tokens redacted from uvicorn's log | 7.5, 7.7 |
+| `routers/inbox.py` | payload returned as JSON; someone else's message → 404 like a missing one; first read time kept | 7.5 |
+| `consumers.py` | the pool member list is written before the commit, so a Redis blip can't lose it | 7.6 |
+| `live_location.py` | a bad message is skipped, a Redis error re-subscribes; neither ends the relay | 7.6 |
+| `main.py` | refuse to start without tables or the public key | 7.7 |
+| `deps.py` | the public key is read once, from `JWT_PUBLIC_KEY_PATH` | 7.2 |
+
+---
+
+## Things to know before the next parts
 
 - **Build order:** the plan builds Notification **after** Trip and Fare (0.7), because it only listens to their events. Both are done, and their events are guarded by contract tests.
+- **Part 8 (running it all)** needs Notification's `JWT_PUBLIC_KEY_PATH` (in `.env`) and the public key mounted, as the plan's compose file already does.
+- **Running Notification for real** needs `alembic upgrade head`, the key, RabbitMQ and Redis. Without tables, the key or RabbitMQ it refuses to start, on purpose.
 - **Data stores:** `notification.db` (the inbox) and **Redis** (the "logged out" list, the pool member sets, and the live-location channels).
 - **The recipient rules are the privacy boundary** of the whole system for anything pushed to phones, and they're **allowlists**: a new field in an event reaches no phone until it's added to `routing.py` on purpose.
 - **Notification never changes other services' data and calls nobody.** If it's down, rides still work, and phones catch up from the inbox.
