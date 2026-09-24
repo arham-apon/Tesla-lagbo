@@ -99,6 +99,7 @@ This file solves 3 classic problems:
 
 1. **"I saved to the DB but crashed before sending the event."** Solved with the **transactional outbox.**
    `emit()` does not send anything. It writes the event into an `outbox` table **in the same transaction** as the business change, so both are saved or neither is.
+   Every event's `occurred_at` has exactly 6 decimals (`2026-09-24T08:41:05.000000Z`), so comparing two times as text gives the right order (fixed during Part 5; see exp5.md).
    A background loop, `run_outbox_relay()`, reads unsent rows, publishes them to RabbitMQ, then marks them `published_at`.
 
 2. **"The same event arrived twice."** Solved with **idempotent consumers.**

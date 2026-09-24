@@ -93,7 +93,8 @@ async def test_pool_lifecycle_from_trip_events(redis):
 async def test_whole_second_envelopes_from_real_emit_keep_order(redis):
     off = envelope("identity.driver.offline", {"driver_id": "jashim"}, "2026-09-24T08:41:05")
     on = envelope("identity.driver.online", {"driver_id": "jashim"}, "2026-09-24T08:41:05.120000")
-    assert off["occurred_at"] == "2026-09-24T08:41:05Z"  # emit() really drops the fraction on a whole second
+    assert off["occurred_at"] == "2026-09-24T08:41:05.000000Z"  # emit() keeps the fraction on a whole second
+    assert off["occurred_at"] < on["occurred_at"]                # so text order = time order
     await consumers.handle(redis, off)
     await consumers.handle(redis, on)
     assert await redis.smembers(AVAILABLE) == {"jashim"}

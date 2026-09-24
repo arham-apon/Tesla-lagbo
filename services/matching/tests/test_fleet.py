@@ -10,11 +10,11 @@ from app import fleet
 from app.fleet import AVAILABLE, GEO, h
 
 JASHIM, KARIM = "jashim", "karim"
-T0 = datetime(2026, 9, 24, 8, 41, 5)  # a whole second: isoformat() gives "...05" with no fraction
+T0 = datetime(2026, 9, 24, 8, 41, 5)  # a whole second: bare isoformat() gives "...05" with no fraction
 
 
 def at(ms: int = 0) -> str:
-    """occurred_at exactly as tesla_common.events.emit writes it."""
+    """occurred_at as emit() wrote it before the fixed-width fix; such events may still sit in outboxes/queues."""
     return (T0 + timedelta(milliseconds=ms)).isoformat() + "Z"
 
 

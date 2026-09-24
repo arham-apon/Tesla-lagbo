@@ -527,7 +527,9 @@ The plan's Trip consumer has the same text comparison: `if shift.state_ts >= ts:
 "occurred_at": utcnow().isoformat(timespec="microseconds") + "Z",   # always 6 decimals
 ```
 
-With a fixed width, text order = time order everywhere. I haven't changed Part 1 without asking. I recommend doing it before Part 5.
+With a fixed width, text order = time order everywhere.
+
+**Done (during Part 5):** `emit()` now writes 6 decimals always, e.g. `2026-09-24T08:41:05.000000Z`. Matching keeps its microsecond comparison anyway: events written in the old format may still be waiting in an outbox or a queue, and it costs nothing.
 
 ---
 
@@ -736,7 +738,7 @@ As with Identity, **Matching against a real RabbitMQ and Redis wasn't run** (Doc
 **`test_consumers.py` (4.7)** builds its events with **Part 1's real `emit()`**, the same function Identity and Trip use, so the format is exactly what will arrive over RabbitMQ:
 - the bindings let in exactly the 3 needed keys out of the 9 in the registry, and `start()` declares `matching.fleet-state` with them;
 - Identity's full online event → online; online then offline → unavailable (added after a break-it check, see below); a pool's life `FORMING` → `COMPLETED` → busy, then free;
-- **`emit()` really writes `...08:41:05Z` on a whole second** (confirmed), and an online 120 ms later is still applied;
+- **`emit()` really writes `...08:41:05Z` on a whole second** (confirmed), and an online 120 ms later is still applied (*after the Part 5 fix, this test checks `...08:41:05.000000Z` instead*);
 - redelivering the same event changes nothing; other event types touch nothing;
 - Redis down → the handler raises (so the bus retries); an event missing `driver_id` → raises (so it ends in the DLQ).
 
@@ -765,7 +767,7 @@ As with Identity, **Matching against a real RabbitMQ and Redis wasn't run** (Doc
 - **Two data stores:** `matching.db` (SQLite: zones and distances, which barely change) and **Redis** (positions and availability, which change constantly). Zones are loaded **into memory at startup** (4.8 step 5), so answering "Banani → Mohakhali?" never even touches the database.
 - **Matching's "who is free" is eventually consistent** (a fraction of a second behind Identity and Trip). By design this is harmless, because Trip re-checks everything atomically when it books.
 - **Docker is still off**, but thanks to fakeredis's GEO support that won't block the Matching tests.
-- **Recommended before Part 5:** the one-line `emit()` change above (fixed-width timestamps), so Trip's consumer can't hit the whole-second bug.
+- **~~Recommended before Part 5~~ Done:** the one-line `emit()` change above (fixed-width timestamps), so Trip's consumer can't hit the whole-second bug.
 - **Part 1's `errors.py` was fixed in 4.6** (422s from `model_validator`s used to crash into 500s). All services use the fixed version automatically: `tesla_common` is installed in editable mode, and Docker copies `libs/common` fresh.
 - **`consumers.py` passes `occurred_at` to `on_pool_updated`** (done in 4.7).
 - **Running Matching for real** needs the zones migrated (`alembic upgrade head`), plus RabbitMQ and Redis. Without zones or RabbitMQ it refuses to start, on purpose.

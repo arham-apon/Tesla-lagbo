@@ -166,7 +166,7 @@ Like 2.1, 3.1 and 4.1, this section is a **scope definition** with no code of it
 
 ## Found while reading ahead (to fix in the right section)
 
-**1. The whole-second timestamp bug is still there (5.7).** Raised in 4.5: Part 1's `emit()` writes `...08:41:05Z` when the time lands exactly on a second, and `...08:41:05.120000Z` otherwise, and **text comparison puts the later one first**. Re-checked on this machine: still `False`. Trip's consumer compares exactly like that (`if shift.state_ts >= ts: return`), so Jashim's "online" could be ignored if the "offline" before it landed on a whole second, and Trip would refuse to make him a pool. **Fix options:** the one-line `isoformat(timespec="microseconds")` in Part 1's `emit()` (fixes every service), or compare real datetimes in Trip's consumer as Matching does. I'll ask before touching Part 1, and in 5.7 at the latest.
+**1. The whole-second timestamp bug (fixed).** Raised in 4.5: Part 1's `emit()` wrote `...08:41:05Z` when the time landed exactly on a second, and `...08:41:05.120000Z` otherwise, and **text comparison put the later one first**. Trip's consumer compares exactly like that (`if shift.state_ts >= ts: return`), so Jashim's "online" could have been ignored, and Trip would refuse to make him a pool. **Fixed** in `libs/common/tesla_common/events.py`: see *Fix: fixed-width event timestamps* below.
 
 **2. Fare doesn't exist yet (5.5).** Trip calls Fare on every request, but Fare is Part 6. That's why the plan says to test the clients with `respx`: Fare's answers are faked in the tests, and a real Fare is only needed when running the whole system.
 
@@ -265,6 +265,40 @@ No tests yet: the first real ones come with the tables in 5.3.
 
 ---
 
+## Fix: fixed-width event timestamps (the bug from 4.5)
+
+**The change:** one line in Part 1's `emit()` (`libs/common/tesla_common/events.py`):
+
+```python
+"occurred_at": utcnow().isoformat(timespec="microseconds") + "Z",   # was: utcnow().isoformat() + "Z"
+```
+
+| Moment | Before | After |
+|---|---|---|
+| exactly 08:41:05 | `2026-09-24T08:41:05Z` | `2026-09-24T08:41:05.000000Z` |
+| 120 ms later | `2026-09-24T08:41:05.120000Z` | `2026-09-24T08:41:05.120000Z` |
+| earlier sorts first as text? | **no** | **yes** |
+
+Every service's events now have the same width, so **text order = time order**. Trip's consumer (5.7) can use the plan's `state_ts >= ts` check as written.
+
+**What else changed:**
+- `services/matching/tests/test_consumers.py`: the test that **confirmed the bug** (`emit()` writes `...05Z`) now confirms the fix (`...05.000000Z`, and it sorts before `...05.120000Z`).
+- `services/matching/tests/test_fleet.py`: comment only. Its helper deliberately builds **old-format** times, because Matching still has to handle them.
+- **Matching's microsecond comparison (4.5) stays.** Events written before the fix may still be sitting in an outbox or a RabbitMQ queue, and the extra check costs nothing.
+- Nothing parses `occurred_at` in a way the extra `.000000` could break: Identity's contract test reads it with `datetime.fromisoformat`, which accepts both.
+
+**How it was checked:**
+
+| Check | Result |
+|---|---|
+| `emit()` on a whole second, then 120 ms later | `...05.000000Z` < `...05.120000Z` as text: **True** |
+| Matching tests | 127 passed |
+| Identity tests | 94 passed |
+| Gateway tests | 65 passed |
+| Break-it: put the old line back | Matching: **1 failed** (the updated `test_consumers.py` test), so the fix is guarded |
+
+---
+
 ## Things to know before the next sections
 
 - **Build order:** the plan's recommended order (0.7) builds **Fare's quotes (Part 6) before Trip**, because Trip calls Fare on every request. This project follows the part numbers instead, so Fare doesn't exist yet. That's fine for building and testing Trip (Fare is faked with `respx`), but running Trip for real needs Fare's quote endpoints.
@@ -272,5 +306,5 @@ No tests yet: the first real ones come with the tables in 5.3.
 - **Trip is the only writer of seat counts.** Every seat change is a compare-and-set on `pools.version` inside `BEGIN IMMEDIATE`. Matching's answers are only advice.
 - **Must send `trip.pool.updated` with `driver_id`, `pool_id`, `status`** (and the rest of the registry fields). Matching's availability set depends on those three (4.7).
 - **Must answer `GET /internal/drivers/{id}/live-pool` with `{"pool_id": ...}`.** Identity already calls it and blocks going offline on anything but a 200.
-- **Recommended before 5.7:** the one-line `emit()` fix (finding 1).
+- **Event times are fixed-width now** (`...05.000000Z`), so Trip's consumer can compare `occurred_at` as text safely, as the plan does.
 - **`respx` is installed** into `.venv` (`uv pip install respx`). On another machine: `uv pip install -r services/trip/requirements-dev.txt`.

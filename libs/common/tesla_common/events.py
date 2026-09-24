@@ -39,7 +39,9 @@ def emit(session: AsyncSession, outbox_model, producer: str, routing_key: str, d
     envelope = {
         "event_id": event_id,
         "event_type": routing_key,
-        "occurred_at": utcnow().isoformat() + "Z",
+        # Always 6 decimals: a bare isoformat() drops ".000000" on a whole second, and then
+        # "08:41:05Z" sorts after "08:41:05.120000Z". Fixed width makes text order = time order.
+        "occurred_at": utcnow().isoformat(timespec="microseconds") + "Z",
         "producer": producer,
         "version": 1,
         "data": data,
