@@ -10,11 +10,16 @@
 | 5.4 | State machine (which status can follow which) | **Done** (explained below) |
 | 5.5 | Core logic (request, join, accept, transitions, sweeper) | **Done** (explained below) |
 | 5.6 | API endpoints | **Done** (explained below) |
-| 5.7 | Messaging integration | Not started |
-| 5.8 | Lifespan (startup and shutdown) | Not started |
-| 5.9 | Step-by-step build + tests | Not started |
+| 5.7 | Messaging integration | **Done** (explained below) |
+| 5.8 | Lifespan (startup and shutdown) | **Done** (explained below) |
+| 5.9 | Step-by-step build + tests | **Done** (explained below) |
 
-This file grows as each section gets done.
+**Part 5 is complete.** Trip & Pooling is written and covered by 341 automated tests, all passing. Run them with:
+
+```
+cd services\trip
+..\..\.venv\Scripts\python -m pytest
+```
 
 ---
 
@@ -674,7 +679,166 @@ The routers run on a test app with Part 1's real error handler, the real test da
 
 ---
 
-## Things to know before the next sections
+## 5.7: messaging (`consumers.py`)
+
+### What Trip sends
+
+Six events, all written to the **outbox in the same transaction** as the change they describe (5.5), then published by Part 1's relay. So "Nusrat was matched" is never saved without its event, or the other way round:
+
+| Event | When | Who listens |
+|---|---|---|
+| `trip.ride.requested` | no pool fitted, offers went out | Notification (buzz Jashim's phone) |
+| `trip.ride.matched` | joined a pool, or a driver accepted | Notification |
+| `trip.ride.status_changed` | arrived, started | Notification |
+| `trip.ride.cancelled` | any cancel | **Fare** (void the quote), Notification |
+| `trip.ride.completed` | dropped off | **Fare** (charge: pooled or solo), Notification |
+| `trip.pool.updated` | any change to a pool | **Matching** (is Jashim free?), Notification (stops on the map) |
+
+The fields are exactly the registry's (0.4). `test_events_contract.py` (5.5) checks every one.
+
+### What Trip listens to
+
+| Queue | Bindings | What it does |
+|---|---|---|
+| `trip.driver-shift` | `identity.driver.*` | keeps `driver_shifts` (Trip's copy of who's online, in which car, how many seats) up to date |
+| `trip.fare-settled` | `fare.ride.settled` | writes the **final fare** and **payment status** onto the ride, so Nusrat sees "৳72.00, paid" in her ride detail |
+
+**Safe to receive twice** (RabbitMQ can redeliver): each handler records the `event_id` in `processed_events` **in the same transaction** as its change. A second delivery sees the id and does nothing. If the handler fails halfway, **both** roll back, so the retry really runs. Failures are retried 3 times, 5 s apart, then parked in `<queue>.dlq` (Part 1's bus).
+
+**Safe to receive out of order**: an event older than the last one applied to that driver is ignored (`state_ts >= occurred_at`). Since the Part 5 timestamp fix, every `occurred_at` has the same width, so comparing them as text is correct, and a test proves the exact whole-second case from 4.5 now works end to end.
+
+### The one change: other `identity.driver.*` events don't mean "offline"
+
+| Plan's code | Problem | Fix |
+|---|---|---|
+| `if online: ... elif shift is not None: shift.is_online = False` | the queue takes **`identity.driver.*`**, so **any** future Identity driver event (say `identity.driver.vehicle_changed`) would silently mark Jashim **offline** in Trip, and he couldn't accept rides | only `.online` and `.offline` change anything; other types are recorded as seen and ignored |
+
+Identity only sends those two today, so nothing was broken yet. But the binding invites new event types, and the failure would be silent.
+
+### Known limitation (not changed)
+
+If a driver's **very first** "online" is delayed (it went round the retry queue) and his "offline" arrives first, Trip has no row to record the offline on, so the late "online" is applied and Trip thinks he's online. Trip only uses this to allow `accept_offer`. Offers only go to drivers **Matching** found free, and Matching handles this case correctly (4.5), so he won't get offers. It clears at his next status change.
+
+### How 5.7 was checked: 13 tests (`test_consumers.py`)
+
+Events are built with **Part 1's real `emit()`**, so the format is exactly what arrives from RabbitMQ:
+- Identity's **exact** online payload creates the shift; offline, then online in another car (Toofan, 6 seats) updates it;
+- a late "offline" after a newer "online" is ignored; **offline on a whole second, online 120 ms later → online** (the 4.5 bug, end to end);
+- redelivery changes nothing; an offline for a driver Trip never saw is harmless; **`identity.driver.vehicle_changed` doesn't take Jashim offline** (the fix);
+- a broken event **raises** (so the bus retries it) and leaves **no** dedupe row, so the retry really runs;
+- final fare and a failed payment are stored; settled twice → one record; an unknown ride isn't an error;
+- `start()` declares exactly the two queues with the plan's bindings, and the handler it registers writes to the right database.
+
+---
+
+## 5.8: startup and shutdown (`main.py`)
+
+**Startup**, in order:
+1. JSON logging as `trip-service`, at `LOG_LEVEL`;
+2. **check the tables exist**, otherwise refuse to start with "run `alembic upgrade head` first" (added, see below);
+3. connect to RabbitMQ;
+4. start the two consumers (5.7);
+5. start two background loops: the **outbox relay** (publishes Trip's events every 0.5 s) and the **sweeper** (5.5, every 15 s).
+
+**Shutdown**, in reverse: stop both loops (and wait for them), close the HTTP clients to Fare and Matching, close RabbitMQ, close the database.
+
+**`/health`** checks the database and RabbitMQ: 200 when both are fine, **503 naming the broken one** otherwise (Part 1's `health_router`). There's no Redis to check.
+
+### Changes to the plan's `main.py`
+
+| Plan says | What I did | Why |
+|---|---|---|
+| `configure_logging("trip-service")` | `configure_logging("trip-service", settings.LOG_LEVEL)` | `LOG_LEVEL` is a setting (5.2) that the plan's code then ignored. Matching passes it too |
+| (nothing) | **refuse to start without tables** | like Matching (4.8). Without it Trip would start "healthy", and then **every** request would be a 500 about a missing table. Now the log says exactly what to do |
+
+### Checked for real (no Docker)
+
+| Command | Result |
+|---|---|
+| `uvicorn app.main:app` on an **empty** database | `RuntimeError: trip.db has no tables: run alembic upgrade head first`, startup failed, as intended |
+| `alembic upgrade head`, then `uvicorn` **with no RabbitMQ** | `-> 0001, init`; then the log is JSON (`"service": "trip-service"`), and startup fails with `AMQPConnectionError`, as intended |
+
+As with Identity and Matching, **Trip against a real RabbitMQ wasn't run** (Docker is off). Part 1 tested the bus and relay against real RabbitMQ; everything Trip adds is tested below with a fake bus.
+
+### How 5.8 was checked: 7 tests (`test_main.py`)
+
+These run the **real `app.main.app`** with its lifespan, on a migrated temp database, with a fake bus that **records what the outbox relay publishes**:
+- startup registers both consumers with the plan's bindings; all 14 endpoints and `/health` are mounted;
+- `/health` → 200 with `db` and `rabbitmq` ok; broker gone → 503 naming `rabbitmq`;
+- **the whole evening, through the real app**: Identity's "online" event → Nusrat requests (HTTP) → `trip.ride.requested` **really leaves through the relay** with Jashim as candidate → he sees and accepts the offer → Identity's live-pool check shows the pool → arrive, start, complete → `trip.ride.completed` (not pooled) and **4 `trip.pool.updated`: `FORMING, FORMING, IN_PROGRESS, COMPLETED`** → Fare's "settled" event → **Nusrat's ride shows ৳105.00 PAID** and the full 5-step history;
+- events leave in the order they happened;
+- shutdown closes the bus and **stops both background loops**;
+- an empty database → refuses to start, **before** connecting to RabbitMQ.
+
+**Break-it checks for 5.7 and 5.8:**
+
+| Deliberately broke... | Result |
+|---|---|
+| out-of-order check removed | 1 failed |
+| the fix reverted (any other type = offline) | 1 failed |
+| final fare not stored | 2 failed |
+| `trip.fare-settled` queue not started | 3 failed |
+| dedupe removed from the **fare** consumer | 1 failed |
+| dedupe removed from the **shift** consumer | **0 failed**, and correctly so: a replay has the same timestamp, so the out-of-order check already drops it. For shifts the dedupe row is a second guard |
+| outbox relay not started | 3 failed |
+| sweeper not started | 1 failed |
+| no table check | 2 failed |
+| bus not closed on shutdown | 1 failed |
+| RabbitMQ missing from `/health` | 1 failed |
+
+---
+
+## 5.9: the step-by-step guide, checked off
+
+| Plan step | Where it was done | Evidence |
+|---|---|---|
+| 1. models → autogenerate → **hand-check** the partial indexes and CHECK rules | 5.3 | `test_migrations.py` reads the real index SQL and every rule by name |
+| 2. `state_machine.py` + tests over **every pair** | 5.4 | 108 combinations; only the 10 allowed (from, to, actor) moves pass |
+| 3. `snapshots.py`, `clients.py` tested with **respx** | 5.5 | `test_clients.py` (24), `test_events_contract.py` |
+| 4. `pooling.py`: **`try_join` first**, tested against a temp SQLite file | 5.5 | `test_pooling.py`, `test_capacity.py` |
+| 5. `lifecycle.py`: passenger cancel after arrival → 409; cancel in `MATCHED` frees the seat; last rider completing → pool `COMPLETED` | 5.5 | `test_lifecycle.py` has all three by name |
+| 6. `consumers.py`, `workers.py` | 5.5, 5.7 | `test_workers.py`, `test_consumers.py` |
+| 7. routers + `main.py` | 5.6, 5.8 | `test_api.py`, `test_ownership.py`, `test_main.py` |
+| 8. `test_concurrency.py`, run **50 times** to shake out flakiness | 5.5, now | `pytest tests/test_concurrency.py --count 50` → **150 passed** (3 races × 50), no flakes |
+
+For step 8 I installed **`pytest-repeat`** (the plan's `--count` option) into `.venv` and added it to `requirements-dev.txt`.
+
+### Part 5 in numbers: 341 tests, all passing
+
+| File | Tests | Section |
+|---|---|---|
+| `test_migrations.py` | 5 | 5.3 |
+| `test_models.py` | 43 | 5.3 |
+| `test_schemas.py` | 27 | 5.3, 5.6 |
+| `test_state_machine.py` | 123 | 5.4 |
+| `test_pooling.py` | 21 | 5.5 |
+| `test_lifecycle.py` | 13 | 5.5 |
+| `test_capacity.py` | 5 | 5.5 |
+| `test_concurrency.py` | 3 | 5.5 |
+| `test_workers.py` | 5 | 5.5 |
+| `test_clients.py` | 24 | 5.5 |
+| `test_events_contract.py` | 3 | 5.5 |
+| `test_ownership.py` | 10 | 5.5, 5.6 |
+| `test_api.py` | 39 | 5.6 |
+| `test_consumers.py` | 13 | **5.7** |
+| `test_main.py` | 7 | **5.8** |
+
+### Everything changed from the plan in Part 5, in one place
+
+| Where | Change | Section |
+|---|---|---|
+| Part 1 `emit()` | event times always have 6 decimals (the 4.5 whole-second bug) | fix |
+| `models.py` | CHECK: history actor is `PASSENGER` / `DRIVER` / `SYSTEM` | 5.3 |
+| `clients.py` | 4xx from Fare/Matching → 503 instead of a crash; quote expiry with a time zone no longer crashes | 5.5 |
+| `migrations/env.py` | don't silence the app's loggers when migrations run in-process | 5.5 |
+| `schemas.py` | `DriverCancelIn`: a driver's cancel needs a reason | 5.6 |
+| `routers/passenger.py` | `?before=` with a time zone is converted, not relabelled | 5.6 |
+| `consumers.py` | only `.online` / `.offline` change a driver's shift | 5.7 |
+| `main.py` | log level from settings; refuse to start without tables | 5.8 |
+
+---
+
+## Things to know before the next parts
 
 - **Build order:** the plan's recommended order (0.7) builds **Fare's quotes (Part 6) before Trip**, because Trip calls Fare on every request. This project follows the part numbers instead, so Fare doesn't exist yet. That's fine for building and testing Trip (Fare is faked with `respx`), but running Trip for real needs Fare's quote endpoints.
 - **Fare and Matching errors reach the phone as 503** (`UPSTREAM_ERROR` / `UPSTREAM_UNAVAILABLE`), or 422 for zone/quote problems. The ride is **not** created when Fare fails, because the quote comes first.
@@ -685,4 +849,6 @@ The routers run on a test app with Part 1's real error handler, the real test da
 - **Must send `trip.pool.updated` with `driver_id`, `pool_id`, `status`** (and the rest of the registry fields). Matching's availability set depends on those three (4.7).
 - **Must answer `GET /internal/drivers/{id}/live-pool` with `{"pool_id": ...}`.** Identity already calls it and blocks going offline on anything but a 200.
 - **Event times are fixed-width now** (`...05.000000Z`), so Trip's consumer can compare `occurred_at` as text safely, as the plan does.
-- **`respx` is installed** into `.venv` (`uv pip install respx`). On another machine: `uv pip install -r services/trip/requirements-dev.txt`.
+- **`respx` and `pytest-repeat` are installed** into `.venv`. On another machine: `uv pip install -r services/trip/requirements-dev.txt`.
+- **Fare (Part 6) must provide** `POST /internal/quotes` and `GET /internal/quotes/{id}` (the `Quote` fields in `clients.py`), and send `fare.ride.settled` with `ride_id`, `total_poysha`, `payment_status`. Trip's consumer reads exactly those.
+- **Running Trip for real** needs `alembic upgrade head`, RabbitMQ, and Fare and Matching reachable. Without tables or RabbitMQ it refuses to start, on purpose.
