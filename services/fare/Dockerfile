@@ -9,4 +9,4 @@ RUN pip install --no-cache-dir /libs/common -r requirements.txt
 COPY services/${SERVICE}/ .
 RUN mkdir -p /data
 EXPOSE 8004
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8004"]
+CMD ["sh", "-c", "alembic upgrade head && python -m app.seed && uvicorn app.main:app --host 0.0.0.0 --port 8004"]

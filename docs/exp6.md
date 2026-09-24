@@ -9,10 +9,15 @@
 | 6.3 | Directory structure | **Done** (explained below) |
 | 6.4 | Data layer (tariff, quotes, fares, wallets) + pricing + distance cache | **Done** (explained below) |
 | 6.5 | API endpoints | **Done** (explained below) |
-| 6.6 | Messaging (settling a ride) | Not started |
-| 6.7 | Step-by-step build + tests | Not started |
+| 6.6 | Messaging (settling a ride) | **Done** (explained below) |
+| 6.7 | Step-by-step build + tests | **Done** (explained below) |
 
-This file grows as each section gets done.
+**Part 6 is complete.** Fare & Billing is written and covered by 151 automated tests, all passing. Run them with:
+
+```
+cd services\fare
+..\..\.venv\Scripts\python -m pytest
+```
 
 ---
 
@@ -187,7 +192,7 @@ The model is a formula with no code of its own (the code, `pricing.py`, comes in
 
 **2. `quotes.voided` is written but never read (6.5/6.6).** When Trip cancels a ride, settlement marks the quote `voided`, but `GET /internal/quotes/{id}` doesn't look at it. So Nusrat could cancel, then request again with the **same** quote within its 10 minutes, and Trip would accept it. It's harmless for money (each ride settles once, on its own `ride_id`), but then "voided" means nothing. I'll decide in 6.5: either refuse voided quotes, or drop the flag. *Decided in 6.5: voided quotes are refused.*
 
-**3. A missing quote or tariff crashes settlement (6.6).** `quote = await s.get(Quote, ...)` then `quote.tariff_id`: an unknown `quote_id` gives `AttributeError`. The bus then retries 3 times and dead-letters it, which is the right outcome, but with a confusing error message. A clear error will make the dead-letter queue readable.
+**3. A missing quote or tariff crashes settlement (6.6).** `quote = await s.get(Quote, ...)` then `quote.tariff_id`: an unknown `quote_id` gives `AttributeError`. The bus then retries 3 times and dead-letters it, which is the right outcome, but with a confusing error message. A clear error will make the dead-letter queue readable. *Fixed in 6.6.*
 
 **4. `REFUNDED` is allowed but nothing produces it (6.4).** The `fares` status rule accepts `PAID / FAILED / REFUNDED`; there's no refund flow in the plan. It's harmless, and leaves room for one later. *Kept as is in 6.4.*
 
@@ -220,9 +225,9 @@ services/fare/
 │   ├── distance.py             Matching + Redis cache (6.4)
 │   ├── schemas.py              request/response shapes (6.5)
 │   ├── quotes.py               making and reading quotes (added in 6.5)
-│   ├── settlement.py           placeholder: settling a ride, code in 6.6
-│   ├── seed.py                 placeholder: demo wallets, code in 6.7
-│   ├── main.py                 placeholder: app + lifespan, code in 6.7
+│   ├── settlement.py           settling a ride (6.6)
+│   ├── seed.py                 demo wallets (6.7)
+│   ├── main.py                 app + lifespan (6.7)
 │   └── routers/
 │       ├── __init__.py
 │       ├── fares.py            placeholder: /fares/estimate, /fares/rides/{id}
@@ -254,7 +259,7 @@ As in Matching and Trip, routers are split **by who calls them**, so each file h
 | (no `config.py` contents given) | `DB_PATH` (`fare.db`), `REDIS_URL`, `RABBITMQ_URL`, `INTERNAL_TOKEN` (required), `MATCHING_URL`, **`QUOTE_TTL_SECONDS=600`**, `LOG_LEVEL` | the plan says quotes "expire in 10 min"; a setting keeps that number in one place |
 | `deps.py` | `db`, `auth`, `bus`, **`redis`** (the distance cache) and **`matching_http`** | what plan step 6.7.7's lifespan needs |
 
-**For 6.7:** the Dockerfile runs `alembic upgrade head` then `uvicorn`. When `seed.py` is written (demo wallets), the Dockerfile will need the `python -m app.seed` step in between, like Identity's.
+**For 6.7:** the Dockerfile runs `alembic upgrade head` then `uvicorn`. When `seed.py` is written (demo wallets), the Dockerfile will need the `python -m app.seed` step in between, like Identity's. *Done in 6.7.*
 
 ---
 
@@ -446,7 +451,168 @@ Matching is faked with `respx`, using the real override distances (Banani ↔ Mo
 
 ---
 
-## Things to know before the next sections
+## 6.6: settling a ride (`settlement.py`)
+
+### What happens when Nusrat is dropped at Mohakhali
+
+Trip marks her ride `COMPLETED` and, in the same transaction, puts `trip.ride.completed` in its outbox (5.5). Moments later RabbitMQ delivers it to Fare's queue **`fare.ride-lifecycle`**:
+
+```
+trip.ride.completed  {ride: nusrat, quote: q-nusrat, seats: 1, pooled: true, payment: WALLET, driver: jashim}
+ │
+ ├─ seen this event before?                 → stop (layer 1: processed_events)
+ ├─ this ride already has a fare?           → stop (layer 2: fares.ride_id is UNIQUE)
+ ├─ price it with the QUOTE's tariff and distance, and Trip's "pooled" → 3000 + 5250 − 1050 = 7200
+ ├─ WALLET: take 7200 from Nusrat IF her balance ≥ 7200 (one UPDATE)
+ │     ├─ yes → RIDE_DEBIT −7200 for her, DRIVER_CREDIT +7200 for Jashim (his wallet is made if needed)
+ │     └─ no  → nothing moves, status FAILED → Notification tells Jashim to collect cash
+ ├─ write the fare row (the ledger line)
+ └─ fare.ride.settled → outbox                                        all in ONE transaction
+```
+
+**`trip.ride.cancelled`** only marks the ride's quote `voided` (so it can't book another ride, 6.5). There's nothing to charge, and no event is sent.
+
+### Why money can't be taken twice
+
+RabbitMQ may deliver the same event twice, and a crash can make Trip's relay publish it again. The plan stacks **three** guards, and the tests break each one separately:
+
+| Layer | Stops | If it were missing |
+|---|---|---|
+| **1.** `processed_events` (same event id) | the same message delivered twice | layer 2 still stops the second fare (a test shows it) |
+| **2.** `fares.ride_id` UNIQUE (checked first, and enforced by the database) | **two different** events for one ride | the database refuses a second fare row for the ride, so the whole second attempt rolls back |
+| **3.** `UNIQUE (ride_id, kind, user_id)` on wallet transactions | a second debit for one ride | the last line of defence, even if the code above were wrong |
+
+And since the whole settlement is **one transaction**, it's all or nothing: never "debited but no fare row", never "fare row but no event". **Five copies of the same ride's event racing each other** end with one fare and one debit (a test).
+
+### "Balance ≥ total" in the UPDATE itself
+
+`UPDATE wallets SET balance = balance − 7200 WHERE user = nusrat AND balance >= 7200` checks and takes in **one** step, so two rides can't both see "enough money" and both take it (the same compare-and-set idea as Trip's seats, 5.5). If the check were ever removed, the 6.4 rule `balance >= 0` would still refuse to let her go negative.
+
+### Changes to the plan's code
+
+| Plan's code | Problem | Fix |
+|---|---|---|
+| `if event_type == "cancelled": … else:` settle | anything that isn't "cancelled" is treated as **"completed"** (the same trap as Trip's consumer, 5.7). Only two types are bound today, but a widened binding would silently charge people | only `trip.ride.completed` settles; other types are recorded as seen and ignored |
+| `quote = s.get(...)`, then `quote.tariff_id` | an unknown quote → `AttributeError: 'NoneType'…` in the dead-letter queue (finding 3) | `LookupError: quote q-9 for ride r-1 not found`. It still retries 3 times and then dead-letters, but now the message says why |
+| wallet payment for any total | a **free** ride (0 base + 100 % pool discount) would write a 0-poysha transaction, which the ledger refuses, so a **valid ride would be dead-lettered** | a 0 total is `PAID` with no money moved |
+| (no `start()`) | | `start(bus, rw)` declares `fare.ride-lifecycle` with the two bindings from the plan's queue table |
+
+### What it relies on from Trip
+
+`trip.ride.completed` must carry `ride_id, passenger_id, driver_id, quote_id, seats, pooled, payment_method` (Trip's contract test, 5.5, checks all of them), and **"pooled" is Trip's decision** (6.1). The price itself comes only from Fare's own quote and tariff. Trip can say "pooled or not", but never "how much".
+
+### How 6.6 was checked: 19 tests (`test_settlement.py`)
+
+Events are built with Part 1's **real `emit()`**, with exactly the fields Trip sends:
+- **Nusrat pays ৳72 from her wallet**: fare row 3000 / 5250 / 1050 / 7200 PAID; her balance 50,000 → 42,800; **Jashim's wallet created with 7200**; the debit and credit rows; `fare.ride.settled` with **exactly the registry's fields**;
+- Rafiq pays ৳54 **cash**: no wallet touched; alone → **8250**, no discount; 2 seats → 14,400;
+- **wallet short by 1 poysha → FAILED, nothing moves**, the event says FAILED; exactly enough → PAID, balance 0; no wallet at all → FAILED;
+- **same event twice → one fare, one debit, one event**; **two different events for one ride → the same**; **5 racing events → one debit**;
+- cancel → quote voided, **no charge, no event**; cancel twice harmless;
+- **tariff locked**: prices changed after the quote → still 7200; an **expired** quote still settles (a long ride);
+- unknown quote → a clear `LookupError`, **nothing left behind** (so the retry really runs);
+- other Trip events ignored (the fix); a free wallet ride moves no money (the fix);
+- **every wallet's balance equals the sum of its transactions** after a mixed evening;
+- `start()` declares the plan's queue and bindings, and its handler settles into the right database.
+
+---
+
+## 6.7: the step-by-step guide, finished
+
+| Plan step | Where | Evidence |
+|---|---|---|
+| 1. models, migrations; `0002_seed_tariff` = tariff 1 (3000, 1500, 20) | 6.4 | `test_migrations.py` |
+| 2. `pricing.py` + the three rows of 6.2 | 6.4 | `test_pricing.py`: 7200 / 5400 / 8250 |
+| 3. `distance.py`; `fares.py`, `internal.py` | 6.4, 6.5 | `test_distance.py`, `test_api.py`, `test_trip_contract.py` |
+| 4. `settlement.py` + tests: duplicate → one fare; wallet short → `FAILED`, balance unchanged | 6.6 | `test_settlement.py` has both by name |
+| 5. `wallet.py`, `driver.py` | 6.5 | `test_api.py` |
+| 6. `seed.py`: wallets Nusrat 50,000, Rafiq 50,000, Shirin 20,000, Jashim 0 (Identity's ids) | **now** | `test_seed.py` |
+| 7. lifespan: bus → consumer → outbox relay → Redis → Matching client | **now** | `test_main.py` |
+
+### `seed.py`: the cast's wallets
+
+The plan's balances, under **Identity's fixed ids** (Jashim `1111…`, Nusrat `2222…`, Rafiq `3333…`, Shirin `4444…`), so the wallets belong to the people who log in.
+
+- **Safe to run on every start** (it's in the Dockerfile now: `alembic upgrade head && python -m app.seed && uvicorn …`): it only adds wallets that don't exist, and **never touches** one that does. It may have been used since.
+- **One change:** each starting balance is also written as a **`TOPUP` transaction**. Otherwise Nusrat's wallet would start with ৳500 that no transaction explains, and "balance = sum of transactions" would be false from day one. A test checks that rule after a whole evening.
+
+### `main.py`: startup and shutdown
+
+**Startup:** JSON logging as `fare` → **check the tables and an active tariff exist** (added, like Matching and Trip) → connect to RabbitMQ → start the settlement consumer → start the outbox relay. Redis and the Matching client are created in `deps.py`, so they're ready before the first request.
+
+**Shutdown:** stop the relay (and wait), close the Matching client, Redis, RabbitMQ and the database.
+
+**`/health`** checks the database, **Redis** and RabbitMQ, and answers 503 naming the one that's down. The Redis check is there even though the cache is optional (6.4), so an operator sees it's down. Estimates keep working without it.
+
+### Checked for real (no Docker)
+
+| Command | Result |
+|---|---|
+| `uvicorn app.main:app` on an empty database | `RuntimeError: fare.db has no tables: run alembic upgrade head first`, as intended |
+| `alembic upgrade head` | `-> 0001, init`, `0001 -> 0002, seed tariff` |
+| `python -m app.seed`, twice | `seed done: Nusrat, Rafiq, Shirin, Jashim`, then `seed done: nothing new` |
+| `uvicorn` with no RabbitMQ | JSON log (`"service": "fare"`), `AMQPConnectionError`, startup failed, as intended |
+
+As with the other services, **Fare against a real RabbitMQ and Redis wasn't run** (Docker is off).
+
+### How 6.7 was checked: 12 tests
+
+| File | Tests | What |
+|---|---|---|
+| `test_seed.py` | 4 | the plan's four balances; starting money recorded as top-ups; **a second run adds nothing and leaves a used wallet alone**; the ids are Identity's |
+| `test_main.py` | 8 | the **real `app.main.app`** with its lifespan and a fake bus that records what the relay publishes: the consumer is registered with the plan's queue; all 7 endpoints + `/health` mounted; health 200 → 503 when the broker goes; **the evening in money**: seeded wallets → both quotes over HTTP → Trip's two `completed` events → **two `fare.ride.settled` really leave through the relay** (Rafiq ৳54 cash, Nusrat ৳72 wallet) → Nusrat sees her fare and **৳428.00** left, **Jashim sees ৳72 in his wallet and earnings of ৳126: ৳54 cash + ৳72 wallet**; a cancel event voids the quote so Trip gets 404; shutdown closes the bus and stops the relay; **refuses to start** without tables, and without a tariff |
+
+**Break-it checks for 6.6 and 6.7:**
+
+| Deliberately broke... | Result |
+|---|---|
+| layer 1 gone (no `processed_events` check) | 1 failed (layer 2 still stops the second fare, as designed) |
+| layer 2 gone (no one-fare-per-ride check) | 2 failed |
+| debit without the "balance ≥ total" check | 1 failed (and the database's `balance >= 0` rule still refuses the overdraft) |
+| driver not credited | 3 failed |
+| cancel doesn't void the quote | 2 failed |
+| priced on **today's** tariff instead of the quote's | 2 failed |
+| fix reverted: other events read as "completed" | 1 failed |
+| fix reverted: free wallet ride writes a 0 transaction | 1 failed |
+| `fare.ride.settled` not sent | 5 failed |
+| seed overwrites existing wallets | 1 failed |
+| seed without top-up transactions | 1 failed |
+| consumer not started | 3 failed |
+| outbox relay not started | 2 failed |
+| no tariff check at startup | 1 failed |
+
+### Part 6 in numbers: 151 tests, all passing
+
+| File | Tests | Section |
+|---|---|---|
+| `test_pricing.py` | 21 | 6.2 / 6.4 |
+| `test_migrations.py` | 6 | 6.4 |
+| `test_models.py` | 41 | 6.4 |
+| `test_distance.py` | 9 | 6.4 |
+| `test_api.py` | 37 | 6.5 |
+| `test_trip_contract.py` | 6 | 6.5 |
+| `test_settlement.py` | 19 | **6.6** |
+| `test_seed.py` | 4 | **6.7** |
+| `test_main.py` | 8 | **6.7** |
+
+### Everything changed from the plan in Part 6, in one place
+
+| Where | Change | Section |
+|---|---|---|
+| `models.py` | one active tariff; quote: pickup ≠ drop-off, distance > 0, pooled ≤ solo; fare: discount only if pooled, no negative parts, 1–6 seats; transaction: sign matches kind, ride money names its ride | 6.4 |
+| `distance.py` | 401/404 from Matching → 503 (not a crash); Redis outage doesn't stop pricing | 6.4 |
+| `quotes.py` (new) | one place for estimate + Trip's quote | 6.5 |
+| `schemas.py` | same-zone estimates refused at the door | 6.5 |
+| `GET /internal/quotes/{id}` | voided quotes → 404 | 6.5 |
+| `/driver/earnings` | failed wallet payments count as cash; refunds don't count | 6.5 |
+| `settlement.py` | only `completed` settles; clear error for an unknown quote; a free ride moves no money | 6.6 |
+| `seed.py` | starting balances recorded as top-ups | 6.7 |
+| `main.py` | refuse to start without tables or an active tariff | 6.7 |
+| `Dockerfile` | runs `python -m app.seed` | 6.7 |
+
+---
+
+## Things to know before the next parts
 
 - **Build order:** the plan's recommended order (0.7) builds Fare's **quotes** before Trip and **settlement** after. This project did Trip first, with Fare faked, so both halves come now.
 - **Data stores:** `fare.db` (SQLite: tariff, quotes, fares, wallets) and **Redis** (the 24 h distance cache only).
@@ -455,4 +621,7 @@ Matching is faked with `respx`, using the real override distances (Banani ↔ Mo
 - **Changing prices** = a new migration: add tariff 2 as active, retire tariff 1 (never delete it). The one-active rule makes a half-done change impossible.
 - **Changing a CHECK rule needs a hand-written migration** (as in Matching and Trip). `test_migrations.py` lists every rule by name.
 - **The fare row is a ledger line:** written once, never updated.
-- **Settlement is driven by Trip's event, not a call**, so it has to be safe to receive twice (the plan uses three layers for that, 6.6).
+- **Settlement is driven by Trip's event, not a call**, so it has to be safe to receive twice (three layers, 6.6).
+- **Notification (Part 7) listens to `fare.ride.settled`**: `payment_status: FAILED` means "tell Jashim to collect cash".
+- **Trip's test fakes** still use made-up prices (finding 5). Optional tidy-up: switch them to the real 8250 / 7200.
+- **Running Fare for real** needs `alembic upgrade head`, the seed, RabbitMQ, Redis and Matching. Without tables, a tariff or RabbitMQ it refuses to start, on purpose.
