@@ -6,7 +6,7 @@
 |---|---|---|
 | 5.1 | Overview & domain scope | **Done** (explained below) |
 | 5.2 | Directory structure | **Done** (explained below) |
-| 5.3 | Data layer (tables, constraints, schemas) | Not started |
+| 5.3 | Data layer (tables, constraints, schemas) | **Done** (explained below) |
 | 5.4 | State machine (which status can follow which) | Not started |
 | 5.5 | Core logic (request, join, accept, transitions, sweeper) | Not started |
 | 5.6 | API endpoints | Not started |
@@ -172,7 +172,7 @@ Like 2.1, 3.1 and 4.1, this section is a **scope definition** with no code of it
 
 **3. `datetime.utcnow()` in the plan's `FareClient` (5.5).** It's deprecated in Python 3.12 and gives a "naive" time. It works as long as Fare's `expires_at` is also naive UTC; I'll use Part 1's `utcnow()` instead so there's one clock everywhere.
 
-**4. Partial unique indexes and autogenerate (5.3).** The plan warns (5.9 step 1) that Alembic's autogenerate can miss `sqlite_where`. Both key rules of Part 5 (one live pool per driver, one active ride per passenger) are partial indexes, so the migration will be **hand-checked** and **tested** (insert a second active ride → rejected).
+**4. Partial unique indexes and autogenerate (5.3).** The plan warns (5.9 step 1) that Alembic's autogenerate can miss `sqlite_where`. Both key rules of Part 5 (one live pool per driver, one active ride per passenger) are partial indexes, so the migration will be **hand-checked** and **tested** (insert a second active ride → rejected). *Done in 5.3: autogenerate kept both here, and a test now reads the real index SQL.*
 
 ---
 
@@ -189,7 +189,7 @@ services/trip/
 ├── alembic.ini
 ├── migrations/
 │   ├── env.py                  same as Identity's and Matching's
-│   └── versions/               empty for now; 0001_init.py comes in 5.3
+│   └── versions/0001_init.py   all 8 tables (added in 5.3)
 ├── app/
 │   ├── __init__.py
 │   ├── config.py               settings
@@ -261,7 +261,7 @@ The Dockerfile starts with `alembic upgrade head && uvicorn ... --port 8003`. Li
 | `alembic heads` with no migrations yet | runs, no error |
 | building `deps` doesn't create a database file | confirmed (`Database` connects lazily) |
 
-No tests yet: the first real ones come with the tables in 5.3.
+No tests in 5.2; the first real ones came with the tables in 5.3.
 
 ---
 
@@ -299,10 +299,108 @@ Every service's events now have the same width, so **text order = time order**. 
 
 ---
 
+## 5.3: the data layer
+
+### Eight tables
+
+| Table | One row is... | Rules the **database** enforces |
+|---|---|---|
+| `driver_shifts` | Trip's copy of a driver who's been online: name, Bullet's nickname, **seat capacity**, online or not | capacity 1–6 |
+| `pools` | one shared trip in one car | capacity 1–6; **0 ≤ `occupied_seats` ≤ `max_capacity`**; status is one of the 4; **one `FORMING`/`IN_PROGRESS` pool per driver**; the driver must be in `driver_shifts` |
+| `ride_requests` | one booking | 1–6 seats; pickup ≠ drop-off; status is one of the 6; `CASH`/`WALLET`; fare ≥ 0; **`MATCHED` or later must have a pool**; **one active ride per passenger**; the pool must exist |
+| `pool_waypoints` | one stop (pickup or drop-off) | `seq` ≥ 1; `PICKUP`/`DROPOFF`; **no two stops share a place in line** (`pool_id`, `seq` unique) |
+| `ride_status_history` | one status change (the audit) | must belong to a real ride; actor is `PASSENGER`, `DRIVER` or `SYSTEM` (**added**, see below) |
+| `ride_offers` | "ride X was offered to driver Y" | one offer per ride per driver; `OFFERED`/`ACCEPTED`/`DECLINED` |
+| `outbox`, `processed_events` | outgoing events / events already handled | from Part 1's mixins, unchanged |
+
+All of it is the plan's code as written, plus one CHECK rule.
+
+**Why so many rules in the database, not just in Python?** Because Part 5's promise is "**never overbooked, never in an impossible state**", and code has bugs. With `occupied_seats <= max_capacity` as a CHECK rule, even a buggy `UPDATE` that tries to squeeze a 5th rider into Bullet is **refused by SQLite** and rolled back. A test proves this with an `UPDATE` that has no version check at all.
+
+### Two rules that are "partial" (and why that matters)
+
+"One active ride per passenger" can't be a plain UNIQUE on `passenger_id`: Nusrat would then be allowed **one ride in her whole life**. It's a **partial** unique index, so only rows in an active status count:
+
+```sql
+CREATE UNIQUE INDEX uq_ride_one_active_per_passenger ON ride_requests (passenger_id)
+WHERE status IN ('REQUESTED','MATCHED','DRIVER_ARRIVED','STARTED')
+```
+
+Same idea for pools: one **live** pool per driver, any number of finished ones.
+
+The plan warns (5.9 step 1) that Alembic's autogenerate can **drop the `WHERE`**. That would turn both into plain UNIQUE indexes, and the second ride Nusrat ever booked would fail. It's a silent disaster, because the first ride in every quick test would still work. I **hand-checked** the migration (autogenerate kept both `WHERE`s this time) and added a test that reads the **real SQL** SQLite stored for each index.
+
+### "Full" and "who's in the pool" are not stored
+
+- **Full** = `occupied_seats = max_capacity`. It's not a status, so it can't disagree with the seat count.
+- **Membership** = `ride_requests.pool_id`. There's no members table.
+
+One fact, one place.
+
+### The one change: `actor_role` has a CHECK rule
+
+| Plan says | What I did | Why |
+|---|---|---|
+| `actor_role: String(10)`, any text | `CHECK (actor_role IN ('PASSENGER','DRIVER','SYSTEM'))` | the history is the audit ("explain exactly what happened"). A typo like `"DIRVER"` or an empty role would make an audit row useless, and nobody would notice until a complaint. The plan's code only ever writes these three (`state_machine.Actor`) |
+
+### The migration: `0001_init.py`
+
+Autogenerated from the models, then **hand-checked** (plan 5.9 step 1): all 8 tables, both partial indexes with their `WHERE`, every CHECK rule. `ck_history_actor` was added to the migration by hand, because Alembic's `check` can't see CHECK rules (found in 4.3). The `.gitkeep` is gone now that the folder has a file.
+
+### `schemas.py`, as in the plan
+
+| Shape | Used for | Rules |
+|---|---|---|
+| `RideCreate` | Nusrat's "Request" | zone codes shaped like `BANANI` (capital letters, digits and `_`, 2–30 characters); pickup ≠ drop-off; 1–6 seats; `CASH` (default) or `WALLET`; optional `quote_id` |
+| `CancelIn` | cancel reason | default `changed_plans`, max 200 characters (the column's size) |
+| `RideOut` / `RideDetailOut` | Nusrat's view of **her own** ride, + its history | read straight from database rows |
+| `PoolOut`, `PoolRider`, `WaypointOut` | Jashim's view of his pool | names and stops, **no fares** |
+| `OfferOut` | "new ride near you" | includes the estimated fare, so Jashim can decide |
+
+`RideCreate` only checks that a zone code **looks** right. Whether `MOTIJHEEL` **exists** is Matching's and Fare's answer (422 `UNKNOWN_ZONE`), so the list of zones lives in one place.
+
+**Privacy, as the PRD asks:** the driver's pool view has no fare fields at all, and the history a passenger sees says **that** the driver cancelled (`actor_role`), not the driver's user id. Both are guarded by tests, so adding a fare field to `PoolOut` later would fail a test.
+
+### How 5.3 was checked: 74 tests, all passing
+
+| File | Tests | What |
+|---|---|---|
+| `test_migrations.py` | 5 | exactly the 8 tables; **both partial indexes keep their `WHERE`** (read from SQLite's stored SQL); every CHECK rule is in the database; models and migration agree (`alembic check`); downgrade to nothing and back |
+| `test_models.py` | 43 | every rule in the table above, with the demo cast. Among them: **Bullet with 3 of 4 seats taken refuses +2 even with no version check**; a double-tap "Request" is refused, but a new ride after a cancelled one is fine; a `MATCHED` ride without a pool is refused; a pool with riders can't be deleted; two stops can't share `seq` 1 |
+| `test_schemas.py` | 26 | seats, zone shape (both fields), pickup ≠ drop-off, payment method, cancel reason length; **`RideOut` and `RideDetailOut` built from real database rows, exactly as 5.6 will do it**; no fares in the driver's view; no actor id in the passenger's history |
+
+`alembic upgrade head` on a fresh file (what the Dockerfile runs) → `-> 0001, init`; `alembic current` → `0001 (head)`.
+
+**Break-it checks** (broke the migration or model on purpose, ran the tests, restored):
+
+| Deliberately broke... | Result |
+|---|---|
+| pool index loses its `WHERE` (the autogenerate risk) | 2 failed |
+| ride index loses its `WHERE` | 2 failed |
+| capacity CHECK removed | 4 failed |
+| "matched needs a pool" CHECK removed | 5 failed |
+| actor CHECK removed | 2 failed |
+| model gains an index the migration lacks | 1 failed (`alembic check`) |
+
+Run them with:
+
+```
+cd services\trip
+..\..\.venv\Scripts\python -m pytest
+```
+
+### Found while doing 5.3 (for later sections)
+
+- **The driver's cancel "`reason` required" (5.6 table) isn't enforced by `CancelIn`.** It has a default (`changed_plans`), which is right for passengers. For Jashim's `PASSENGER_NO_SHOW` cancel, 5.6 will need a separate shape with no default, or a check in the router.
+- **`ride_offers.driver_id` has no link to `driver_shifts`**, on purpose (as in the plan): offers go to the candidates Matching found, and a missing shift row mustn't make creating the ride fail. The plan's `accept_offer` (5.5) already handles a missing shift: 409 `DRIVER_OFFLINE`.
+
+---
+
 ## Things to know before the next sections
 
 - **Build order:** the plan's recommended order (0.7) builds **Fare's quotes (Part 6) before Trip**, because Trip calls Fare on every request. This project follows the part numbers instead, so Fare doesn't exist yet. That's fine for building and testing Trip (Fare is faked with `respx`), but running Trip for real needs Fare's quote endpoints.
-- **One data store:** `trip.db` (SQLite). No Redis.
+- **One data store:** `trip.db` (SQLite). No Redis. Run `alembic upgrade head` before starting (the Dockerfile does).
+- **Changing a CHECK rule needs a hand-written migration** (as in Matching). `test_migrations.py` lists every rule by name, so a missing one fails a test.
 - **Trip is the only writer of seat counts.** Every seat change is a compare-and-set on `pools.version` inside `BEGIN IMMEDIATE`. Matching's answers are only advice.
 - **Must send `trip.pool.updated` with `driver_id`, `pool_id`, `status`** (and the rest of the registry fields). Matching's availability set depends on those three (4.7).
 - **Must answer `GET /internal/drivers/{id}/live-pool` with `{"pool_id": ...}`.** Identity already calls it and blocks going offline on anything but a 200.
