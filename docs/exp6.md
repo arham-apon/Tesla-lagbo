@@ -8,7 +8,7 @@
 | 6.2 | Fare model (the formula, hand-checkable) | **Done** (explained below) |
 | 6.3 | Directory structure | **Done** (explained below) |
 | 6.4 | Data layer (tariff, quotes, fares, wallets) + pricing + distance cache | **Done** (explained below) |
-| 6.5 | API endpoints | Not started |
+| 6.5 | API endpoints | **Done** (explained below) |
 | 6.6 | Messaging (settling a ride) | Not started |
 | 6.7 | Step-by-step build + tests | Not started |
 
@@ -183,9 +183,9 @@ The model is a formula with no code of its own (the code, `pricing.py`, comes in
 
 ## Found while reading ahead (to fix in the right section)
 
-**1. Pickup = drop-off would be priced at ৳30 (6.5).** *Half done in 6.4: the database now refuses such a quote. The friendly 422 at the door comes with the request shape in 6.5.* Matching's distance for the same zone is **0 m**, so an estimate for Banani → Banani would quote the base fare. Trip already refuses this (5.3), but `POST /fares/estimate` is also called directly by the app. Fare's request shape needs the same "must differ" rule.
+**1. Pickup = drop-off would be priced at ৳30 (6.5).** *Fixed: the database refuses such a quote (6.4), and the request is refused at the door with a 422 (6.5).* Matching's distance for the same zone is **0 m**, so an estimate for Banani → Banani would quote the base fare. Trip already refuses this (5.3), but `POST /fares/estimate` is also called directly by the app. Fare's request shape needs the same "must differ" rule.
 
-**2. `quotes.voided` is written but never read (6.5/6.6).** When Trip cancels a ride, settlement marks the quote `voided`, but `GET /internal/quotes/{id}` doesn't look at it. So Nusrat could cancel, then request again with the **same** quote within its 10 minutes, and Trip would accept it. It's harmless for money (each ride settles once, on its own `ride_id`), but then "voided" means nothing. I'll decide in 6.5: either refuse voided quotes, or drop the flag.
+**2. `quotes.voided` is written but never read (6.5/6.6).** When Trip cancels a ride, settlement marks the quote `voided`, but `GET /internal/quotes/{id}` doesn't look at it. So Nusrat could cancel, then request again with the **same** quote within its 10 minutes, and Trip would accept it. It's harmless for money (each ride settles once, on its own `ride_id`), but then "voided" means nothing. I'll decide in 6.5: either refuse voided quotes, or drop the flag. *Decided in 6.5: voided quotes are refused.*
 
 **3. A missing quote or tariff crashes settlement (6.6).** `quote = await s.get(Quote, ...)` then `quote.tariff_id`: an unknown `quote_id` gives `AttributeError`. The bus then retries 3 times and dead-letters it, which is the right outcome, but with a confusing error message. A clear error will make the dead-letter queue readable.
 
@@ -218,7 +218,8 @@ services/fare/
 │   ├── models.py               tables (6.4)
 │   ├── pricing.py              compute() (6.4)
 │   ├── distance.py             Matching + Redis cache (6.4)
-│   ├── schemas.py              placeholder: request/response shapes, code in 6.5
+│   ├── schemas.py              request/response shapes (6.5)
+│   ├── quotes.py               making and reading quotes (added in 6.5)
 │   ├── settlement.py           placeholder: settling a ride, code in 6.6
 │   ├── seed.py                 placeholder: demo wallets, code in 6.7
 │   ├── main.py                 placeholder: app + lifespan, code in 6.7
@@ -347,11 +348,110 @@ cd services\fare
 
 ---
 
+## 6.5: the API endpoints
+
+The phone calls `/api/v1/fares/...`, `/api/v1/wallet...` and `/api/v1/driver/earnings`; the gateway checks the login and forwards (Part 2). Trip calls `/internal/quotes` directly with the internal token.
+
+### The 7 endpoints
+
+| Method | Route | Who | Answer | Errors |
+|---|---|---|---|---|
+| POST | `/fares/estimate` | PASSENGER | **201** a quote: solo and pooled price, both breakdowns, valid 10 min | 422 bad input / same zone / unknown zone; 503 Matching down or no active tariff |
+| GET | `/fares/rides/{ride_id}` | PASSENGER or DRIVER | **200** the settled fare | 404 not settled yet, or **not yours** |
+| GET | `/wallet` | PASSENGER or DRIVER | **200** balance + latest transactions, newest first (`?limit=`, default 20) | — (no wallet yet → balance 0) |
+| POST | `/wallet/topup` | PASSENGER | **200** new balance | 422 outside 1–500,000 poysha |
+| GET | `/driver/earnings` | DRIVER | **200** `{rides, total, cash, wallet}` | — |
+| POST | `/internal/quotes` | Trip (internal token) | **201** a quote for `passenger_id` | 422, 503 |
+| GET | `/internal/quotes/{id}` | Trip (internal token) | **200** the quote | 404 unknown **or voided** |
+
+### Nusrat asks "how much?"
+
+```
+POST /fares/estimate  {"pickup_zone": "BANANI", "dropoff_zone": "MOHAKHALI", "seats": 1}
+→ 201 {"quote_id": "…", "distance_m": 3500,
+       "solo_total_poysha": 8250,   "solo":   {base 3000, distance 5250, discount 0,    total 8250},
+       "pooled_total_poysha": 7200, "pooled": {base 3000, distance 5250, discount 1050, total 7200},
+       "expires_at": "…+10 min"}
+```
+
+1. The request shape refuses bad input **before** anything else: zone codes like `BANANI`, 1–6 seats, **pickup ≠ drop-off** (finding 1, now closed at the door as well as in the database).
+2. The distance comes from `distance.py` (Matching, cached 24 h), **before** the write lock, so a slow Matching never blocks other writers.
+3. Then, in one transaction: the **active** tariff, `compute()` twice (solo and pooled), and the quote saved **with its tariff id**.
+
+The app later sends that `quote_id` to `POST /rides` (Trip), so the price she saw is the price she books.
+
+### The shared piece: `quotes.py` (added)
+
+The plan says Trip's internal quote is "the same as estimate, `passenger_id` in body". So the work lives **once**, in a small new module, `quotes.py`, used by both routers:
+- `create_quote(...)`: the three steps above;
+- `get_quote(...)`: reads a quote back for Trip;
+- `quote_out(...)`: builds the answer. The two breakdowns are **recomputed from the quote's own tariff and distance**, so they always match the saved totals, even after prices change (a test changes the tariff and gets the **same** quote back).
+
+### Decisions
+
+| Plan says | What I did | Why |
+|---|---|---|
+| `GET /internal/quotes/{id}` → 404 if missing | also **404 if voided** (finding 2) | a cancelled ride's quote can't book another ride. Trip already turns this 404 into `QUOTE_NOT_FOUND` for the phone |
+| estimate "422 zone" | **same-zone refused at the door** (`EstimateIn`, same rule as Trip's `RideCreate`) | Matching would say 0 m → a ৳30 quote. The database also refuses it (6.4) |
+| (no rule for "which tariff") | the **active** one; none → **503 `NO_ACTIVE_TARIFF`** | the 6.4 "only one active" rule makes this unambiguous |
+| quotes "expire in 10 min" | `QUOTE_TTL_SECONDS` (600) from settings | one place for the number |
+| `/driver/earnings`: "sum over fares" | **cash** = cash fares + **wallet fares that FAILED**; **wallet** = wallet fares PAID; **refunded fares don't count** | when Nusrat's wallet is short, Jashim **collects cash** (plan 6.6). Counting that as "wallet" would show money that never reached his wallet |
+| `GET /fares/rides/{id}`: passenger or driver "only if … = me" | a passenger is matched on `passenger_id`, a driver on `driver_id`, anyone else **404** (not 403) | same as Trip: Rafiq can't even learn that Nusrat's ride has a fare |
+| `GET /wallet` "any" | PASSENGER or DRIVER | Jashim sees his `DRIVER_CREDIT`s; only passengers can top up |
+
+### How money stays right here
+
+- **Top-up is one statement**: "insert the wallet, or add to it if it exists" (the plan's SQLite upsert), plus a `TOPUP` transaction, **in one transaction**. **10 top-ups at the same moment** add up to exactly 10 × ৳10 with 10 transaction rows (a test).
+- **The wallet list is private**: Rafiq sees ৳0 and no transactions after Nusrat tops up.
+- **Double-tapping "top up"** would add money twice unless the app sends an `Idempotency-Key`. The gateway replays the first answer for any `POST` with a key, but **requires** one only on `POST /rides` (Part 2). It's simulated money, so this is noted, not changed.
+
+### Trip's real client, against Fare's real endpoints
+
+Each service was tested against the **plan** on its own. `test_trip_contract.py` checks that they fit **each other**: Trip's `clients.py` (5.5) imports nothing from Trip's app, so the test loads **Trip's actual `FareClient`** and points it at **Fare's actual routers**, in-process:
+
+| Trip does… | Fare answers… | Trip ends up with… |
+|---|---|---|
+| new quote for Nusrat | 201 quote | 8250 / 7200, 3500 m |
+| re-checks the app's quote | 200, Fare's time **without** a zone | accepted (Trip's 5.5 expiry fix handles either form) |
+| Rafiq uses Nusrat's quote | 200 | **`QUOTE_MISMATCH`** |
+| an expired quote | 200 | **`QUOTE_EXPIRED`** |
+| a voided or unknown quote | 404 | **`QUOTE_NOT_FOUND`** (422 to the phone) |
+| an unknown zone | 422 with Matching's message | `UNKNOWN_ZONE` "Unknown zone MOTIJHEEL" |
+
+### How 6.5 was checked: 43 new tests (120 in total), all passing
+
+Matching is faked with `respx`, using the real override distances (Banani ↔ Mohakhali 3500 m, Banani ↔ Gulshan 1 2000 m).
+
+| File | Tests | What |
+|---|---|---|
+| `test_api.py` | 37 | estimate: **8250 / 7200 with both breakdowns**; saved with tariff 1, **expires in 10 min**; Rafiq **5400**, 2 seats **16,500 / 14,400**; Matching asked **once**, then cached; a new active tariff → new prices; no active tariff → 503; bad input (incl. **same zone**) → 422 **without asking Matching**; unknown zone → 422 with its message; drivers can't estimate (403), no user (401); `X-Request-Id` reaches Matching. Internal: Trip's quote, read back identical; Trip's fields present; not found; **voided → 404**; **a quote keeps its price after a tariff change**; token required; `passenger_id` required. Fares: Nusrat **and** Jashim see it; **Rafiq, another driver, and Nusrat-pretending-to-be-a-driver get 404**; not settled → 404. Wallet: none → 0; top-up creates then adds; limits 0 / −100 / 500,001 refused, 500,000 allowed; drivers can't top up but see their credits; **wallets are private**; newest first + limit; **10 concurrent top-ups all count**. Earnings: **cash, failed-wallet-as-cash, paid wallet, refunded excluded, another driver's excluded**; none yet → zeros; passengers 403 |
+| `test_trip_contract.py` | 6 | the table above: **Trip's real `FareClient` ↔ Fare's real routers** |
+
+**Break-it checks** (broke the code on purpose, ran all tests, restored):
+
+| Deliberately broke... | Result |
+|---|---|
+| same zone allowed at the door | 1 failed |
+| voided quotes still served | 2 failed |
+| quote priced with any tariff, not the active one | 1 failed |
+| quote lifetime ignored (1 day) | 1 failed |
+| a fare visible to anyone | 1 failed |
+| a driver matched on `passenger_id` | 2 failed |
+| top-up **replaces** the balance instead of adding | 3 failed |
+| top-up leaves no transaction | 3 failed |
+| wallet shows everyone's transactions | 1 failed |
+| earnings: failed wallet not counted as cash | 1 failed |
+| earnings: refunds counted | 1 failed |
+| internal routes without the token | 1 failed |
+
+---
+
 ## Things to know before the next sections
 
 - **Build order:** the plan's recommended order (0.7) builds Fare's **quotes** before Trip and **settlement** after. This project did Trip first, with Fare faked, so both halves come now.
 - **Data stores:** `fare.db` (SQLite: tariff, quotes, fares, wallets) and **Redis** (the 24 h distance cache only).
 - **Money is whole poysha everywhere.** No floats, ever.
+- **A voided quote is gone for booking** (404 to Trip). Settlement (6.6) is what voids it, when Trip cancels a ride.
 - **Changing prices** = a new migration: add tariff 2 as active, retire tariff 1 (never delete it). The one-active rule makes a half-done change impossible.
 - **Changing a CHECK rule needs a hand-written migration** (as in Matching and Trip). `test_migrations.py` lists every rule by name.
 - **The fare row is a ledger line:** written once, never updated.

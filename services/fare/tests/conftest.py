@@ -56,3 +56,46 @@ async def add(db: Database, *rows) -> None:
         for r in rows:
             s.add(r)
             await s.flush()  # insert in the given order, so parents exist before children
+
+
+# ---- 6.5: the HTTP API ------------------------------------------------------------------------------------------
+
+GATEWAY = {"X-Internal-Token": INTERNAL_TOKEN}
+MATCHING = "http://matching.test"
+
+
+def as_user(user_id: str, role: str = "PASSENGER", name: str = "") -> dict:
+    """The headers the gateway adds after checking the JWT (Part 2)."""
+    return GATEWAY | {"X-User-Id": user_id, "X-User-Role": role, "X-User-Name": name or user_id}
+
+
+@pytest.fixture
+async def matching_http():
+    from tesla_common.http import ServiceClient
+    http = ServiceClient(MATCHING, INTERNAL_TOKEN, "matching")
+    yield http
+    await http.aclose()
+
+
+@pytest.fixture
+async def api(db, redis, matching_http, monkeypatch):
+    """The four routers on a test app, with the test database, fakeredis and a Matching client aimed at respx.
+    The routers import db / redis / matching_http from deps at load time, so they are swapped on each module."""
+    import httpx
+    from fastapi import FastAPI
+
+    from tesla_common.errors import install_error_handlers
+
+    from app.routers import driver, fares, internal, wallet
+
+    for module in (fares, wallet, driver, internal):
+        monkeypatch.setattr(module, "db", db)
+    for module in (fares, internal):
+        monkeypatch.setattr(module, "redis", redis)
+        monkeypatch.setattr(module, "matching_http", matching_http)
+    app = FastAPI()
+    install_error_handlers(app)
+    for module in (fares, wallet, driver, internal):
+        app.include_router(module.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fare") as c:
+        yield c
