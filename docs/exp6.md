@@ -1,0 +1,204 @@
+# Step 6 Explained: the Fare & Billing Service
+
+## Progress
+
+| Section | What it is | Status |
+|---|---|---|
+| 6.1 | Overview & domain scope | **Done** (explained below) |
+| 6.2 | Fare model (the formula, hand-checkable) | **Done** (explained below) |
+| 6.3 | Directory structure | Not started |
+| 6.4 | Data layer (tariff, quotes, fares, wallets) + pricing + distance cache | Not started |
+| 6.5 | API endpoints | Not started |
+| 6.6 | Messaging (settling a ride) | Not started |
+| 6.7 | Step-by-step build + tests | Not started |
+
+This file grows as each section gets done.
+
+---
+
+## The big picture in 30 seconds
+
+So far:
+- **Gateway** (Part 2): the front door.
+- **Identity** (Part 3): who everyone is, and whether Jashim is working.
+- **Matching** (Part 4): the map and the pooling advice.
+- **Trip** (Part 5): books rides, guards Bullet's seats, runs each ride from request to drop-off.
+
+Part 6 builds the service that answers **"how much?"**, twice:
+
+1. **Before the ride (a quote):** Nusrat opens the app, picks Banani → Mohakhali, and sees **৳82.50 alone, ৳72.00 if pooled**. Trip also asks for a quote when she taps "Request" and saves both numbers on her ride.
+2. **After the ride (settlement):** Trip announces "Nusrat's ride is complete, it **was** pooled, she pays by **wallet**". Fare works out the final ৳72.00, takes it from her TeslaPay wallet, credits Jashim, writes a permanent record, and announces "settled, PAID". Trip copies that onto her ride (5.7), and Notification tells her phone.
+
+```
+                              Fare & Billing :8004
+                 ┌───────────────────────────────────────────────────┐
+Nusrat's phone ──┼▶ POST /fares/estimate  ("how much?")               │──▶ Matching: Banani → Mohakhali = 3500 m
+ (via Gateway)   │   GET /fares/rides/{id}, GET /wallet, POST /wallet/topup   (cached in Redis 24 h)
+Jashim's phone ──┼▶ GET /driver/earnings                              │
+Trip ────────────┼▶ POST /internal/quotes, GET /internal/quotes/{id}  │
+                 │   tariff, quotes, fares, wallets    (fare.db)      │
+RabbitMQ ────────┼▶ trip.ride.completed / cancelled                   │──▶ outbox ──▶ fare.ride.settled
+                 └───────────────────────────────────────────────────┘
+```
+
+---
+
+## 6.1: what Fare owns and what it delegates
+
+The plan says:
+
+> **Owns:** tariff, quotes, final fares (immutable ledger rows), simulated TeslaPay wallets, driver earnings.
+> **Delegates:** distances (Matching), deciding whether a ride was pooled (Trip reports it in the event).
+
+### Owns (1): the tariff, "the price list"
+
+Three numbers, stored in the database (not in code), so prices can change without a new release:
+
+| | Value | In taka |
+|---|---|---|
+| base fare (per seat) | 3000 poysha | ৳30 |
+| per km | 1500 poysha | ৳15/km |
+| pool discount | 20 % of the distance charge | |
+
+Tariffs have an **id**. A new price list is a **new row**, and the old one stays, because old quotes point at it (see "locked at quote time" in 6.2).
+
+**All money is in poysha** (1 taka = 100 poysha), as **whole numbers**. No `0.1 + 0.2 = 0.30000000000000004` surprises, and the database can check the arithmetic exactly (6.4).
+
+### Owns (2): quotes
+
+A quote is **a promise of a price**: "Banani → Mohakhali, 1 seat, 3500 m: ৳82.50 alone, ৳72.00 pooled, valid 10 minutes, using tariff 1". Trip stores the quote id on the ride (5.5), and checks the quote belongs to **this** passenger, route and seat count, and hasn't expired.
+
+### Owns (3): final fares, "immutable ledger rows"
+
+One row per completed ride, **written once and never changed**: who paid, base, distance charge, discount, total, cash or wallet, PAID or FAILED. That's an accountant's **ledger**: you don't edit a line, you add a new one (a refund would be a new record, not a changed total). If anyone asks "why did I pay ৳72?", this row, plus the quote and tariff it came from, is the answer.
+
+### Owns (4): TeslaPay wallets (simulated)
+
+Each person has a balance, and every change is a **transaction row**: `TOPUP`, `RIDE_DEBIT` (Nusrat pays), `DRIVER_CREDIT` (Jashim earns). No real payment gateway (plan decision): top-up is a button that adds money. Balances can never go below zero (a database CHECK rule, 6.4). If Nusrat's wallet is short, the payment is **FAILED**, nothing is taken, and Notification tells Jashim to collect cash.
+
+### Owns (5): driver earnings
+
+"How much did I make today?" is simply the sum of Jashim's fares, split into cash and wallet. Nothing extra is stored: it's worked out from the ledger, so it can't disagree with it.
+
+### Delegates (1): distances belong to Matching
+
+Fare asks Matching `GET /internal/zones/distance?from=BANANI&to=MOHAKHALI` → 3500 m (Part 4) and **caches the answer in Redis for 24 h** (`fare:dist:BANANI:MOHAKHALI`). One owner of distances means Nusrat is **priced** on the same 3500 m she's **routed** on (4.1). The cache means Fare doesn't call Matching on every estimate. The cost: if a distance override ever changes, Fare's cache must be cleared (noted in 4.8).
+
+### Delegates (2): "was it pooled?" belongs to Trip
+
+Fare doesn't look at pools. Trip decides (5.5's rule: 2 or more rides in the pool that weren't cancelled) and puts `pooled: true/false` in `trip.ride.completed`. Fare trusts it. So there's one definition of "pooled", in the service that knows who was in the car.
+
+### Where Fare sits
+
+```
+Identity ──▶ Trip ──▶ Fare ──▶ Matching
+```
+
+Fare is called by **Trip** (quotes) and calls only **Matching** (distances). Nothing Fare calls ever calls back into Fare, so there's no circle (Part 0.2). Settlement doesn't need a call at all: it's driven by Trip's **event**, so a slow Fare never delays a drop-off.
+
+### What Fare does *not* do
+
+| Question | Who answers it |
+|---|---|
+| How far is Banani → Mohakhali? | Matching |
+| Was Nusrat's ride pooled? | Trip |
+| Who is this user? | Gateway + Identity |
+| Put Nusrat in Bullet / guard the seats | Trip |
+| Push "you paid ৳72.00" to her phone | Notification (listens to `fare.ride.settled`) |
+| Store the final fare on her ride history | Trip (copies it from `fare.ride.settled`, 5.7) |
+
+---
+
+## What I did for 6.1
+
+Like 4.1 and 5.1, this section is a **scope definition** with no code, so I added no files to `services/fare/` and checked what Fare will depend on:
+
+| Check | Result |
+|---|---|
+| Part 1 pieces Fare uses: `Bus`, `emit`, `first_time`, `run_outbox_relay`, `OutboxMixin`/`ProcessedEventMixin`, `InternalAuth`, `ServiceClient`, `health_router`, `DomainError` | all used by Trip already, all import OK |
+| Matching's distance endpoint | `GET /internal/zones/distance?from=&to=` → `{"distance_m": 3500}`, 422 `UNKNOWN_ZONE` (Part 4, tested) |
+| **What Trip will call** (5.5's `FareClient`) | `POST /internal/quotes` and `GET /internal/quotes/{id}` are both in Fare's plan (6.5). Trip reads `quote_id, passenger_id, pickup_zone, dropoff_zone, seats, distance_m, solo_total_poysha, pooled_total_poysha, expires_at`; Fare's `QuoteOut` has all of them (plus the breakdowns) |
+| **What Trip sends** | `trip.ride.completed` carries everything settlement reads (`ride_id, passenger_id, driver_id, quote_id, seats, pooled, payment_method`); `trip.ride.cancelled` carries `quote_id`. Checked against Trip's contract test (5.5) |
+| **What Trip reads back** | Trip's consumer (5.7) takes `ride_id`, `total_poysha`, `payment_status` from `fare.ride.settled`; the plan's settlement sends all three |
+| Gateway routes | `/api/v1/fares`, `/api/v1/wallet`, `/api/v1/driver/earnings` → Fare (Part 2). `/driver/earnings` wins over Trip's `/driver` because the gateway tries the longest prefix first |
+| Seed wallets need Identity's fixed ids (6.7 step 6) | Identity's seed has them: Jashim `1111…`, Nusrat `2222…`, Rafiq `3333…`, Shirin `4444…` |
+
+---
+
+## 6.2: the fare model
+
+### The formula
+
+```
+distance_charge = distance_m × per_km_poysha ÷ 1000          (round down)
+pool_discount   = distance_charge × pool_discount_pct ÷ 100  (round down; 0 if not pooled)
+per_seat        = base_poysha + distance_charge − pool_discount
+total           = per_seat × seats
+```
+
+In words: **৳30 to get in, ৳15 per km, and 20 % off the km part if you shared the car.** Every seat pays the same.
+
+Things worth noticing:
+- **`distance_m` is the rider's *solo* distance**, Banani → Mohakhali = 3500 m, even if the pooled route went via Gulshan 1 and took longer. Nusrat isn't charged for Rafiq's detour. The 140 % rule (4.4) limits how long that detour can be.
+- **The discount is only on the distance part**, not the ৳30 base. A pooled ride is always cheaper, but never below the base.
+- **A 2-seat booking pays twice** the per-seat price: Nusrat + a friend, pooled, Banani → Mohakhali = 2 × 7200 = **14,400** (৳144.00).
+- **"Round down" happens per seat, then × seats.** So the total is always exactly base + distance − discount, which is what the `fares` table's CHECK rule demands (6.4).
+
+### The plan's three examples, by hand
+
+| Rider | Trip | distance | base | distance charge | discount | **Total** |
+|---|---|---|---|---|---|---|
+| Nusrat | Banani → Mohakhali, 1 seat, **pooled** | 3500 m | 3000 | 3500 × 1500 ÷ 1000 = **5250** | 5250 × 20 ÷ 100 = **1050** | 3000 + 5250 − 1050 = **7200 (৳72.00)** |
+| Rafiq | Banani → Gulshan 1, 1 seat, **pooled** | 2000 m | 3000 | 2000 × 1500 ÷ 1000 = **3000** | 3000 × 20 ÷ 100 = **600** | 3000 + 3000 − 600 = **5400 (৳54.00)** |
+| Nusrat alone | Banani → Mohakhali, 1 seat, solo | 3500 m | 3000 | **5250** | **0** | 3000 + 5250 = **8250 (৳82.50)** |
+
+Pooling saves Nusrat ৳10.50 (1050 poysha). These three rows are the PRD's "pooled fares calculate correctly" tests, and plan step 6.7.2 turns them into `test_pricing.py`.
+
+### "Tariff locked at quote time"
+
+The quote records **which tariff** priced it (`quotes.tariff_id`). Settlement prices the ride with **that** tariff and the **quote's** distance, not today's. So:
+- if the price list changes while Nusrat is in the car, she still pays what she was shown;
+- if a distance override changes mid-ride, same thing.
+
+What *can* change between quote and settlement is only **pooled or not**, and that's the point: she's shown both prices, and pays the pooled one only if she really shared.
+
+### What I did for 6.2
+
+The model is a formula with no code of its own (the code, `pricing.py`, comes in 6.4), so I **checked it against Matching's real distance table**. I migrated a throwaway Matching database and priced **every one of the 72 zone pairs** with tariff v1 (a script in the scratchpad, not in the project):
+
+| Check | Result |
+|---|---|
+| Banani → Mohakhali | 3500 m → **8250 solo, 7200 pooled**, the plan's numbers |
+| Banani → Gulshan 1 | 2000 m → 6000 solo, **5400 pooled**, the plan's number |
+| Gulshan 1 → Mohakhali | 2000 m → 6000 / 5400 |
+| cheapest pair | Banani → Gulshan 2, 1000 m → ৳45.00 solo / ৳42.00 pooled |
+| most expensive pair | Uttara → Dhanmondi, 18,700 m → ৳310.50 solo / ৳254.40 pooled |
+| distances the same both ways | yes, all 72 |
+| **does "round down" ever cut anything?** | **no, not once** (see below) |
+| same zone (Banani → Banani) | Matching answers **0 m** (see finding 1) |
+
+**Why rounding never bites with tariff v1:** Matching rounds every distance to **100 m** (4.3). 100 m × ৳15/km = 150 poysha exactly, and 20 % of any multiple of 150 is a multiple of 30. So every charge and discount is a whole number of poysha, and the floors in the formula are only there for **future** tariffs (say ৳17/km), where they guarantee whole poysha and never overcharge.
+
+---
+
+## Found while reading ahead (to fix in the right section)
+
+**1. Pickup = drop-off would be priced at ৳30 (6.5).** Matching's distance for the same zone is **0 m**, so an estimate for Banani → Banani would quote the base fare. Trip already refuses this (5.3), but `POST /fares/estimate` is also called directly by the app. Fare's request shape needs the same "must differ" rule.
+
+**2. `quotes.voided` is written but never read (6.5/6.6).** When Trip cancels a ride, settlement marks the quote `voided`, but `GET /internal/quotes/{id}` doesn't look at it. So Nusrat could cancel, then request again with the **same** quote within its 10 minutes, and Trip would accept it. It's harmless for money (each ride settles once, on its own `ride_id`), but then "voided" means nothing. I'll decide in 6.5: either refuse voided quotes, or drop the flag.
+
+**3. A missing quote or tariff crashes settlement (6.6).** `quote = await s.get(Quote, ...)` then `quote.tariff_id`: an unknown `quote_id` gives `AttributeError`. The bus then retries 3 times and dead-letters it, which is the right outcome, but with a confusing error message. A clear error will make the dead-letter queue readable.
+
+**4. `REFUNDED` is allowed but nothing produces it (6.4).** The `fares` status rule accepts `PAID / FAILED / REFUNDED`; there's no refund flow in the plan. It's harmless, and leaves room for one later. I'll keep it and say so.
+
+**5. Trip's test fakes use made-up prices (Part 5).** Trip's `FakeFare` quotes 11000 / 8800, and the 5.8 end-to-end test settles ৳105.00. They're only fakes, so nothing is wrong, but once Fare exists the tests would read better with the real 8250 / 7200. Optional tidy-up, later.
+
+---
+
+## Things to know before the next sections
+
+- **Build order:** the plan's recommended order (0.7) builds Fare's **quotes** before Trip and **settlement** after. This project did Trip first, with Fare faked, so both halves come now.
+- **Data stores:** `fare.db` (SQLite: tariff, quotes, fares, wallets) and **Redis** (the 24 h distance cache only).
+- **Money is whole poysha everywhere.** No floats, ever.
+- **The fare row is a ledger line:** written once, never updated.
+- **Settlement is driven by Trip's event, not a call**, so it has to be safe to receive twice (the plan uses three layers for that, 6.6).
