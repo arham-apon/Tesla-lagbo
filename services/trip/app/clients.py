@@ -20,7 +20,7 @@ class Quote(BaseModel):
     expires_at: datetime
 
 
-def _naive_utc(dt: datetime) -> datetime:
+def naive_utc(dt: datetime) -> datetime:
     # utcnow() is naive UTC. If Fare ever sends "...Z", comparing aware with naive would raise TypeError (a 500).
     return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
 
@@ -46,7 +46,7 @@ class FareClient:
             q = Quote.model_validate(_ok(resp, "fare").json())
             if (q.passenger_id, q.pickup_zone, q.dropoff_zone, q.seats) != (passenger_id, pickup, dropoff, seats):
                 raise DomainError("QUOTE_MISMATCH", "Quote does not match this request", 422)
-            if _naive_utc(q.expires_at) < utcnow():
+            if naive_utc(q.expires_at) < utcnow():
                 raise DomainError("QUOTE_EXPIRED", "Quote expired; request a new estimate", 422)
             return q
         resp = await self.c.request("POST", "/internal/quotes", request_id=request_id,

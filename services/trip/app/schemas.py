@@ -25,6 +25,12 @@ class CancelIn(BaseModel):
     reason: str = Field(default="changed_plans", max_length=200)
 
 
+class DriverCancelIn(BaseModel):
+    # Not in the plan's schemas, but its 5.6 table says the driver's reason is required (e.g. PASSENGER_NO_SHOW):
+    # the audit must say why a driver dropped a rider. CancelIn's default only makes sense for passengers.
+    reason: str = Field(min_length=1, max_length=200)
+
+
 class DriverBrief(BaseModel):
     driver_id: str
     driver_name: str

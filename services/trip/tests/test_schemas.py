@@ -3,7 +3,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.models import RideRequest, RideStatusHistory
-from app.schemas import CancelIn, DriverBrief, PoolOut, RideCreate, RideDetailOut, RideOut
+from app.schemas import CancelIn, DriverBrief, DriverCancelIn, PoolOut, RideCreate, RideDetailOut, RideOut
 from conftest import NUSRAT, add, ride
 
 BANANI_TO_MOHAKHALI = {"pickup_zone": "BANANI", "dropoff_zone": "MOHAKHALI", "seats": 1}
@@ -95,3 +95,11 @@ def test_driver_view_has_no_fares():
     # PRD: passengers see only their own fare; the driver sees names and stops, never fares.
     fields = set(PoolOut.model_fields) | set(PoolOut.model_fields["riders"].annotation.__args__[0].model_fields)
     assert not {f for f in fields if "fare" in f or "poysha" in f}
+
+
+def test_driver_cancel_needs_a_reason():
+    # 5.6: the driver's reason is required (no default), so the audit always says why a rider was dropped.
+    assert DriverCancelIn(reason="PASSENGER_NO_SHOW").reason == "PASSENGER_NO_SHOW"
+    for bad in ({}, {"reason": ""}, {"reason": "x" * 201}):
+        with pytest.raises(ValidationError):
+            DriverCancelIn(**bad)

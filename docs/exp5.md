@@ -9,7 +9,7 @@
 | 5.3 | Data layer (tables, constraints, schemas) | **Done** (explained below) |
 | 5.4 | State machine (which status can follow which) | **Done** (explained below) |
 | 5.5 | Core logic (request, join, accept, transitions, sweeper) | **Done** (explained below) |
-| 5.6 | API endpoints | Not started |
+| 5.6 | API endpoints | **Done** (explained below) |
 | 5.7 | Messaging integration | Not started |
 | 5.8 | Lifespan (startup and shutdown) | Not started |
 | 5.9 | Step-by-step build + tests | Not started |
@@ -391,7 +391,7 @@ cd services\trip
 
 ### Found while doing 5.3 (for later sections)
 
-- **The driver's cancel "`reason` required" (5.6 table) isn't enforced by `CancelIn`.** It has a default (`changed_plans`), which is right for passengers. For Jashim's `PASSENGER_NO_SHOW` cancel, 5.6 will need a separate shape with no default, or a check in the router.
+- **The driver's cancel "`reason` required" (5.6 table) isn't enforced by `CancelIn`.** It has a default (`changed_plans`), which is right for passengers. For Jashim's `PASSENGER_NO_SHOW` cancel, 5.6 will need a separate shape with no default, or a check in the router. *Done in 5.6: `DriverCancelIn`.*
 - **`ride_offers.driver_id` has no link to `driver_shifts`**, on purpose (as in the plan): offers go to the candidates Matching found, and a missing shift row mustn't make creating the ride fail. The plan's `accept_offer` (5.5) already handles a missing shift: 409 `DRIVER_OFFLINE`.
 
 ---
@@ -581,6 +581,96 @@ A test that breaks the database on purpose found that the sweeper's "iteration f
 | client fix reverted: 4xx parsed as a quote | 6 failed |
 | client fix reverted: timezone expiry | 4 failed |
 | accepting doesn't mark the offer `ACCEPTED` | 1 failed |
+
+---
+
+## 5.6: the API endpoints
+
+The phone calls `/api/v1/...`; the gateway checks the login, strips `/api/v1`, adds `X-User-Id` / `X-User-Role` / `X-User-Name` and the internal token, and forwards the request (Part 2). `/api/v1/driver/location` and `/driver/earnings` go to Matching and Fare. **Every other `/driver/...` path, and all of `/rides`, comes here.**
+
+### The 14 endpoints
+
+**Nusrat (`routers/passenger.py`, role PASSENGER):**
+
+| Method | Route | Answer | Errors |
+|---|---|---|---|
+| POST | `/rides` | **201** her ride: `MATCHED` + driver if she joined a pool, else `REQUESTED` | 409 `ACTIVE_RIDE_EXISTS`, 422 bad zone/quote/seats, 503 Fare or Matching down |
+| GET | `/rides` | her rides, newest first; `?status=`, `?limit=` (1–100, default 20), `?before=` | 422 bad query |
+| GET | `/rides/{id}` | her ride + **history** + driver | 404 |
+| POST | `/rides/{id}/cancel` | the cancelled ride (reason optional, default `changed_plans`) | 404, 409 (e.g. Jashim already arrived) |
+
+**Jashim (`routers/driver.py`, role DRIVER):**
+
+| Method | Route | Answer | Errors |
+|---|---|---|---|
+| GET | `/driver/offers` | his open offers, **oldest first** (whoever has waited longest) | — |
+| POST | `/driver/offers/{ride}/accept` | **the new pool** | 404 no offer; 409 offline / car too small / already has a pool / someone was faster |
+| POST | `/driver/offers/{ride}/decline` | **204** | 404 |
+| GET | `/driver/pool` | his live pool, or **204** if none | — |
+| GET | `/driver/pools` | past pools, newest first, `?limit=` | — |
+| POST | `/driver/rides/{id}/arrive` · `start` · `complete` | the pool, after the move | 404 not in his pool, 409 wrong order |
+| POST | `/driver/rides/{id}/cancel` | the pool; **reason required** (e.g. `PASSENGER_NO_SHOW`) | 404, 409, 422 no reason |
+
+**Other services (`routers/internal.py`, internal token only):**
+
+| Method | Route | Answer |
+|---|---|---|
+| GET | `/internal/drivers/{id}/live-pool` | `{"pool_id": "..."}` or `{"pool_id": null}`. Identity asks this before letting Jashim go offline (Part 3) |
+
+### How the routers are built
+
+They're **thin**: they check who's calling, turn the request into a call to 5.5's code (`request_ride`, `accept_offer`, `transition`), and shape the answer. No business rule lives in a router, so the rules tested in 5.5 are the same rules the phone gets.
+
+- **Who's calling**: `auth.role("PASSENGER")` / `auth.role("DRIVER")` from Part 1. A passenger on a driver route gets **403**; no internal token or no user gets **401**.
+- **Whose ride**: checked by `transition()` (5.5) and by `_ride_out` for reads. Someone else's ride is **404**, same as a ride that doesn't exist.
+- **Arrive / start / complete / cancel return the pool**, not just the ride. After every tap, Jashim's app gets the full updated stop list and rider statuses in one answer.
+- `passenger.py` is the plan's code. `driver.py`, `internal.py` and the `GET /rides` list are written to the plan's table (the plan only shows the passenger router "as representative").
+
+### Decisions
+
+| Plan says | What I did | Why |
+|---|---|---|
+| driver cancel: "`reason` required" | new **`DriverCancelIn`**: reason 1–200 characters, **no default** (found in 5.3) | the plan's `CancelIn` defaults to `changed_plans`, so a driver could drop a rider with no real reason in the audit |
+| `GET /rides?before=<iso>` | a time with a zone (`+06:00`, what a phone in Dhaka may send) is **converted** to UTC, not just relabelled | simply dropping the `+06:00` would shift the page by **6 hours** (a test proves the difference) |
+| `GET /rides` (no detail) | each ride carries its **driver** too, loaded with **one** extra query for the whole page | the ride list can show "Bullet · Jashim" without the app asking again for each ride |
+| offers "whose ride is still `REQUESTED`" | also sorted **oldest first** | the rider who has waited longest is at the top |
+| decline | one guarded `UPDATE ... WHERE driver = me AND status = 'OFFERED'` | declining twice, declining after accepting, or declining **someone else's** offer are all 404, in one statement |
+| `GET /driver/pool` → "204" | a real empty 204 (no body) | an empty 200 would make the app parse `null` |
+
+### What each side can see (privacy, as the PRD asks)
+
+- **Nusrat** sees her own rides only (list, detail, cancel), her **own** fare, the driver's name and car, and her history. The history says **that** the driver cancelled (`actor_role`), not the driver's user id.
+- **Jashim** sees riders' **names and stops**, and the estimated fare on an **offer** (so he can decide). The pool he's driving has **no fares at all**; a test checks that no `fare`/`poysha` text appears in the accept answer.
+- **Offers are private**: Karim can't see, accept or decline Jashim's offers.
+
+### How 5.6 was checked: 45 new tests (321 in total), all passing
+
+The routers run on a test app with Part 1's real error handler, the real test database, and the fake Fare and Matching (swapped in on each router module, since the routers import them at load time). Every request carries the headers the gateway would add.
+
+| File | Tests | What |
+|---|---|---|
+| `test_api.py` | 39 | every endpoint: request → `REQUESTED` or **joins Bullet** (with driver); 2nd ride 409; bad input 422 (4 kinds); drivers can't request (403); no gateway token / no user (401); list newest-first, status filter, **paging with `before`**, **Dhaka time converted**, bad query 422; detail with history (no actor id); cancel, and **no cancel after Jashim arrived**; offers (fields, only open ones, only his); accept → pool with named stops and **no fares**; accept refusals; decline (204, twice → 404, after accept → 404); live pool (204 / 200) and past pools; **arrive → start → complete through HTTP** (pool `FORMING → IN_PROGRESS → COMPLETED`); skipping a step 409; driver cancel **without a reason 422**; no-show visible in Nusrat's history; passengers on driver routes 403; **live-pool for Identity** (null → pool id → null after the trip); internal needs the token; **`X-Request-Id` reaches Fare and Matching**; offers stored for the right drivers |
+| `test_ownership.py` | +5 | through HTTP (plan 8.5): Rafiq can't read or cancel Nusrat's ride (404); Karim gets 404 on **every** move on Jashim's rider; Rafiq's list never shows Nusrat's rides; offers are private; **Karim can't decline Jashim's offer** |
+| `test_schemas.py` | +1 | `DriverCancelIn` refuses no reason, an empty reason, and 201 characters |
+
+**Break-it checks** (broke a router on purpose, ran the HTTP tests, restored):
+
+| Deliberately broke... | Result |
+|---|---|
+| ride detail without the owner check | 2 failed |
+| ride list shows everyone's rides | 2 failed |
+| `before` relabelled instead of converted | 1 failed |
+| offers still shown for rides already taken | 1 failed |
+| decline works on any driver's offer | **0 failed at first** → added "Karim can't decline Jashim's offer" → now 1 fails |
+| driver cancel with the passenger's default reason | 2 failed |
+| internal route without the token | 1 failed |
+| live-pool also counts finished pools | 1 failed |
+| driver routes open to passengers | 1 failed |
+
+### Not done here (next sections)
+
+- **`main.py`** (5.8) will mount these three routers plus `/health`, and start the consumers and the sweeper. Until then the routers only run in tests.
+- The **gateway** already sends `/api/v1/rides` and `/api/v1/driver/...` here (Part 2), and requires an `Idempotency-Key` on `POST /api/v1/rides`, so a double-tapped "Request" with the same key gets the **first answer replayed** (or 409 `IDEMPOTENCY_IN_PROGRESS` if the first is still running), not a second booking attempt.
 
 ---
 

@@ -139,3 +139,46 @@ class FakeMatching:
                             "total_route_m": 0, "added_route_m": 0, "max_detour_pct": 100, "plan": plan})
         return {"solo_distance_m": 3500, "compatible_pools": options,
                 "candidate_drivers": [{"driver_id": d, "distance_m": m} for d, m in self.candidates]}
+
+
+# ---- 5.6: the HTTP API ------------------------------------------------------------------------------------------
+
+GATEWAY = {"X-Internal-Token": INTERNAL_TOKEN}
+
+
+def as_user(p: Principal) -> dict:
+    """The headers the gateway adds after checking the JWT (Part 2)."""
+    return GATEWAY | {"X-User-Id": p.user_id, "X-User-Role": p.role, "X-User-Name": p.name}
+
+
+@pytest.fixture
+def fare() -> FakeFare:
+    return FakeFare()
+
+
+@pytest.fixture
+def matching() -> FakeMatching:
+    return FakeMatching()
+
+
+@pytest.fixture
+async def api(db, fare, matching, monkeypatch):
+    """The three routers on a test app, using the test database and the fake Fare and Matching.
+    The routers import `db` / clients from deps at import time, so they are swapped on each router module."""
+    import httpx
+    from fastapi import FastAPI
+
+    from tesla_common.errors import install_error_handlers
+
+    from app.routers import driver, internal, passenger
+
+    for module in (passenger, driver, internal):
+        monkeypatch.setattr(module, "db", db)
+    monkeypatch.setattr(passenger, "fare_client", fare)
+    monkeypatch.setattr(passenger, "matching_client", matching)
+    app = FastAPI()
+    install_error_handlers(app)
+    for module in (passenger, driver, internal):
+        app.include_router(module.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://trip") as c:
+        yield c
