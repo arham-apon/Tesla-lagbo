@@ -48,3 +48,61 @@ async def add(db: Database, *rows) -> None:
         for r in rows:
             s.add(r)
             await s.flush()
+
+
+# ---- 7.5: login tokens, the WebSocket and the inbox API ----------------------------------------------------------
+
+import time  # noqa: E402
+import uuid  # noqa: E402
+
+import jwt  # noqa: E402
+from cryptography.hazmat.primitives import serialization  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
+
+GATEWAY = {"X-Internal-Token": INTERNAL_TOKEN}
+
+
+def as_user(user_id: str, role: str = "PASSENGER") -> dict:
+    """The headers the gateway adds after checking the JWT (Part 2)."""
+    return GATEWAY | {"X-User-Id": user_id, "X-User-Role": role, "X-User-Name": user_id}
+
+
+@pytest.fixture(scope="session")
+def keys() -> tuple[str, str]:
+    """An RS256 key pair standing in for Identity's (Part 3). Returns (private_pem, public_pem)."""
+    k = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private = k.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                              serialization.NoEncryption()).decode()
+    public = k.public_key().public_bytes(serialization.Encoding.PEM,
+                                         serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+    return private, public
+
+
+@pytest.fixture
+def make_token(keys):
+    """A login token as Identity issues it (Part 3): RS256, issuer tesla-identity, sub/role/jti/iat/exp."""
+    def make(user_id: str = NUSRAT, role: str = "PASSENGER", ttl: float = 3600, key: str | None = None,
+             **overrides) -> str:
+        now = time.time()
+        claims = {"sub": user_id, "role": role, "jti": str(uuid.uuid4()), "iat": int(now), "exp": now + ttl,
+                  "iss": "tesla-identity"} | overrides
+        return jwt.encode(claims, key or keys[0], algorithm="RS256")
+    return make
+
+
+@pytest.fixture
+async def api(db, monkeypatch):
+    """The inbox router on a test app with the test database, called as the gateway would."""
+    import httpx
+    from fastapi import FastAPI
+
+    from tesla_common.errors import install_error_handlers
+
+    from app.routers import inbox
+
+    monkeypatch.setattr(inbox, "db", db)
+    app = FastAPI()
+    install_error_handlers(app)
+    app.include_router(inbox.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://notification") as c:
+        yield c

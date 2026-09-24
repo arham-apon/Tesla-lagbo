@@ -8,7 +8,7 @@
 | 7.2 | Directory structure | **Done** (explained below) |
 | 7.3 | Data layer (the inbox) | **Done** (explained below) |
 | 7.4 | Recipient rules (who hears about what) + connections | **Done** (explained below) |
-| 7.5 | API endpoints (WebSocket + inbox) | Not started |
+| 7.5 | API endpoints (WebSocket + inbox) | **Done** (explained below) |
 | 7.6 | Messaging (inbox queue, broadcast queue, live location) | Not started |
 | 7.7 | Step-by-step build + tests | Not started |
 
@@ -133,15 +133,15 @@ Like 5.1 and 6.1, this is a **scope definition** with no code of its own. I chec
 
 ## Found while reading ahead (to fix in the right section)
 
-**1. A socket outlives the login (7.5).** The token and the "logged out" list are checked **once**, when the socket opens. If Nusrat logs out, or her token expires an hour later, an already-open socket keeps receiving her messages. With a 1-hour token it's a small window, but "log out" should mean it. **Proposed:** close the socket when the token's `exp` passes, and re-check the "logged out" list now and then (e.g. on each ping).
+**1. A socket outlives the login (7.5).** The token and the "logged out" list are checked **once**, when the socket opens. If Nusrat logs out, or her token expires an hour later, an already-open socket keeps receiving her messages. With a 1-hour token it's a small window, but "log out" should mean it. **Proposed:** close the socket when the token's `exp` passes, and re-check the "logged out" list now and then (e.g. on each ping). *Fixed in 7.5.*
 
-**2. The token travels in the URL (7.5).** `/ws?token=…` is the usual way (a browser can't add headers to a WebSocket), but URLs end up in **access logs**. Uvicorn's log line includes the query string (checked in its source: it logs `"WebSocket /ws?token=…" [accepted]` using the path **with** the query), so every login token would be written to Notification's log. **Proposed:** keep the query parameter, but make sure the access log doesn't print it.
+**2. The token travels in the URL (7.5).** `/ws?token=…` is the usual way (a browser can't add headers to a WebSocket), but URLs end up in **access logs**. Uvicorn's log line includes the query string (checked in its source: it logs `"WebSocket /ws?token=…" [accepted]` using the path **with** the query), so every login token would be written to Notification's log. **Proposed:** keep the query parameter, but make sure the access log doesn't print it. *Fixed in 7.5 (the filter; it's switched on at startup in 7.7).*
 
 **3. A Redis hiccup can lose a pool's member list (7.6).** In the plan's `persist`, the inbox rows **and the "already processed" mark** are committed first, and **then** the Redis member set is written. If Redis fails at that moment, the event is retried, but the retry sees "already processed" and stops, so the member list is **never** written. Nusrat wouldn't see the car moving until the next pool change. **Proposed:** the member-set write is a full replacement, so it's safe to repeat. Do it even when the event was already processed.
 
 **4. `ride.matched` is sent to the passenger as-is (7.4).** It contains `driver_id` and `joined_existing_pool` besides the driver's name and car. Nothing secret, and no co-rider data, but the plan's privacy column only promises "driver name + Bullet". I'll decide in 7.4 whether to trim it, and test that no co-rider id ever reaches a passenger. *Decided in 7.4: every message is now an allowlist of named fields (see 7.4).*
 
-**5. A binary WebSocket message would crash the loop (7.5).** `receive_text()` raises if the phone sends bytes, and only `WebSocketDisconnect` is caught, so the socket would be dropped with an error logged, not cleanly. It's harmless but noisy; the loop should ignore anything that isn't `"ping"`.
+**5. A binary WebSocket message would crash the loop (7.5).** `receive_text()` raises if the phone sends bytes, and only `WebSocketDisconnect` is caught, so the socket would be dropped with an error logged, not cleanly. It's harmless but noisy; the loop should ignore anything that isn't `"ping"`. *Fixed in 7.5.*
 
 ---
 
@@ -171,8 +171,8 @@ services/notification/
 │   ├── main.py                 placeholder: app + lifespan, code in 7.7
 │   └── routers/
 │       ├── __init__.py
-│       ├── ws.py               placeholder: WS /ws, code in 7.5
-│       └── inbox.py            placeholder: /notifications, code in 7.5
+│       ├── ws.py               WS /ws (7.5)
+│       └── inbox.py            /notifications (7.5)
 └── tests/
     └── conftest.py             sets the environment before app.config is imported
 ```
@@ -341,6 +341,67 @@ Keeps, **for this copy of the service**, each person's open sockets (phone + tab
 
 ---
 
+## 7.5: the API endpoints
+
+| Method | Route | Who | Answer |
+|---|---|---|---|
+| WS | `/ws?token=<JWT>` | anyone with a valid login, **directly** on port 8005 | the socket stays open; `"ping"` → `"pong"`; messages from 7.4 arrive as JSON. Bad, expired or logged-out login → closed with **4401** |
+| GET | `/notifications?after_id=&limit=` | anyone, **through the gateway** | **200** my messages newer than `after_id`, oldest first, at most `limit` (1–100, default 50) |
+| POST | `/notifications/{id}/read` | anyone, through the gateway | **204**; someone else's or a missing message → **404** |
+
+### The WebSocket: four changes from the plan
+
+The plan's `ws.py` is ten lines. I kept its shape, and fixed four things; the first was found while writing it:
+
+| Plan's code | Problem | Fix |
+|---|---|---|
+| bad token → `await ws.close(code=4401)` **before** `accept()` | checked in uvicorn's source, and proved with a real server: closing a socket that was never accepted is answered as a plain **HTTP 403** handshake refusal. **The phone never sees 4401**, so it can't tell "log in again" from any other failure | **accept, then close with 4401**. A test runs both orders on a real server: the plan's gives the client a 403, the fixed one a proper 4401 |
+| login checked **once**, when the socket opens (finding 1) | after logging out, or an hour later when the token expires, the socket kept receiving her messages | the socket waits for a message **at most 30 s** (or until the token expires, if sooner), then re-checks: **expired or on the "logged out" list → close 4401**. Every message from the phone triggers the same check. So "log out" closes her other devices' sockets within 30 s |
+| `receive_text()` in the loop (finding 5) | a **binary** frame raises, and the socket is dropped with an error in the log | any frame that isn't the text `"ping"` is simply ignored |
+| `token: str = Query(...)` | a **missing** token is refused by FastAPI's own validation before accepting → again a bare **403** | a missing token is treated like a bad one → 4401 |
+
+### The token in the log (finding 2)
+
+Confirmed on a real server: uvicorn logs every socket as `"WebSocket /ws?token=eyJhbGci…" [accepted]`, so **every login token would be written to Notification's log**, where anyone reading the logs could reuse it for up to an hour. `RedactTokenFilter` rewrites it to `token=***` in any log line. It's switched on for uvicorn's loggers at startup (7.7). A test runs a real server twice: without the filter, the token **is** in the log; with it, only `token=***` is.
+
+### The inbox
+
+- **Catch-up** is the query 7.3's index was built for: `WHERE user_id = me AND id > after_id ORDER BY id LIMIT n`. The next page is `after_id =` the last id on this page. The `payload` comes back as **JSON** (the message exactly as it was pushed), not as a string inside a string.
+- **Mark read**: only my own messages. Someone else's message and a missing one get the **same** 404, so ids can't be probed. Reading twice keeps the **first** time it was read.
+- Both need the gateway's internal token **and** a user (401 otherwise), like every other service's routes.
+
+### How 7.5 was checked: 27 new tests (66 in total), all passing
+
+**`test_ws.py` (15)** runs a **real uvicorn server** in the test, with the real `websockets` client library, Identity-style RS256 tokens made from a test key pair, and fakeredis for the "logged out" list:
+- ping → pong; **a pushed message reaches her phone and her tablet, and not Rafiq**; hanging up forgets the socket; **binary frames are ignored** (finding 5);
+- **6 kinds of bad login → 4401**: garbage, signed with another key, expired, wrong issuer, **missing**, and no `jti`;
+- **the plan's order really gives a bare 403** (the reason for the first fix);
+- a logged-out token is refused **at the door** (with the periodic re-check pushed out of the way, and never registered);
+- **logging out closes an already-open socket**, without her sending anything (finding 1);
+- **a token that expires closes the socket** about a second later, on its own (finding 1);
+- **the token is in uvicorn's log without the filter, and only `token=***` with it** (finding 2).
+
+**`test_inbox.py` (12)**: catch-up from the start (payload as JSON); after the last one seen; paging covers everything exactly once; **inboxes are private** (Rafiq and Jashim see only their own); bad queries → 422; no gateway token or no user → 401; mark read; **reading twice keeps the first time**; **someone else's message → 404, the same answer as a missing one**, and theirs stays unread.
+
+**Break-it checks** (broke the code on purpose, ran all tests, restored):
+
+| Deliberately broke... | Result |
+|---|---|
+| **the plan's order**: close before accept | 7 failed |
+| "logged out" not checked at connect | **0 failed at first**: the 30 s re-check closed it a moment later anyway. Made that test switch the re-check off → now 1 fails |
+| login never re-checked while open | 2 failed |
+| expiry ignored (only logout re-checked) | 1 failed |
+| the plan's `receive_text` (binary crashes) | 1 failed |
+| redaction filter does nothing | 1 failed |
+| catch-up shows everyone's inbox | 5 failed |
+| catch-up newest first | 4 failed |
+| mark read without the owner check | 1 failed |
+| reading twice overwrites the time | 1 failed |
+
+(While doing these, a socket that never closed made the test server wait forever on shutdown. The test server now gives open sockets 1 second, so a broken build fails instead of hanging.)
+
+---
+
 ## Things to know before the next sections
 
 - **Build order:** the plan builds Notification **after** Trip and Fare (0.7), because it only listens to their events. Both are done, and their events are guarded by contract tests.
@@ -348,3 +409,5 @@ Keeps, **for this copy of the service**, each person's open sockets (phone + tab
 - **The recipient rules are the privacy boundary** of the whole system for anything pushed to phones, and they're **allowlists**: a new field in an event reaches no phone until it's added to `routing.py` on purpose.
 - **Notification never changes other services' data and calls nobody.** If it's down, rides still work, and phones catch up from the inbox.
 - **Phones connect to port 8005 directly for the socket**, and through the gateway for the inbox.
+- **Close code 4401 = "log in again".** The app should get a fresh token and reconnect, then catch up with `after_id`. Any other close = just reconnect.
+- **Logging out closes the other devices' sockets within 30 s** (`RECHECK_SECONDS`).
