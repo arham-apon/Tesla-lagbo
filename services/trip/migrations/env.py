@@ -13,7 +13,8 @@ from app.models import Base
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # Don't silence loggers the app already created (e.g. trip.sweeper) when migrations run in-process (tests).
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 # Tests point Alembic at a throwaway database via config.set_main_option("sqlalchemy.url", ...).

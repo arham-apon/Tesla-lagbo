@@ -7,8 +7,8 @@
 | 5.1 | Overview & domain scope | **Done** (explained below) |
 | 5.2 | Directory structure | **Done** (explained below) |
 | 5.3 | Data layer (tables, constraints, schemas) | **Done** (explained below) |
-| 5.4 | State machine (which status can follow which) | Not started |
-| 5.5 | Core logic (request, join, accept, transitions, sweeper) | Not started |
+| 5.4 | State machine (which status can follow which) | **Done** (explained below) |
+| 5.5 | Core logic (request, join, accept, transitions, sweeper) | **Done** (explained below) |
 | 5.6 | API endpoints | Not started |
 | 5.7 | Messaging integration | Not started |
 | 5.8 | Lifespan (startup and shutdown) | Not started |
@@ -168,9 +168,9 @@ Like 2.1, 3.1 and 4.1, this section is a **scope definition** with no code of it
 
 **1. The whole-second timestamp bug (fixed).** Raised in 4.5: Part 1's `emit()` wrote `...08:41:05Z` when the time landed exactly on a second, and `...08:41:05.120000Z` otherwise, and **text comparison put the later one first**. Trip's consumer compares exactly like that (`if shift.state_ts >= ts: return`), so Jashim's "online" could have been ignored, and Trip would refuse to make him a pool. **Fixed** in `libs/common/tesla_common/events.py`: see *Fix: fixed-width event timestamps* below.
 
-**2. Fare doesn't exist yet (5.5).** Trip calls Fare on every request, but Fare is Part 6. That's why the plan says to test the clients with `respx`: Fare's answers are faked in the tests, and a real Fare is only needed when running the whole system.
+**2. Fare doesn't exist yet (5.5).** *Handled in 5.5: Fare is faked in every test.* Trip calls Fare on every request, but Fare is Part 6. That's why the plan says to test the clients with `respx`: Fare's answers are faked in the tests, and a real Fare is only needed when running the whole system.
 
-**3. `datetime.utcnow()` in the plan's `FareClient` (5.5).** It's deprecated in Python 3.12 and gives a "naive" time. It works as long as Fare's `expires_at` is also naive UTC; I'll use Part 1's `utcnow()` instead so there's one clock everywhere.
+**3. `datetime.utcnow()` in the plan's `FareClient` (5.5).** It's deprecated in Python 3.12 and gives a "naive" time. *Fixed in 5.5, and it turned out to be a real crash, not just a deprecation. See 5.5.*
 
 **4. Partial unique indexes and autogenerate (5.3).** The plan warns (5.9 step 1) that Alembic's autogenerate can miss `sqlite_where`. Both key rules of Part 5 (one live pool per driver, one active ride per passenger) are partial indexes, so the migration will be **hand-checked** and **tested** (insert a second active ride → rejected). *Done in 5.3: autogenerate kept both here, and a test now reads the real index SQL.*
 
@@ -396,9 +396,199 @@ cd services\trip
 
 ---
 
+## 5.4: the state machine (`state_machine.py`)
+
+### The ride's life
+
+```
+                 ┌──────────── CANCELLED ◀───────────┬──────────────────┐
+                 │  passenger / system        passenger / driver      driver (no-show)
+                 │                                   │                  │
+ (new) ──▶ REQUESTED ──────────▶ MATCHED ──────────▶ DRIVER_ARRIVED ──▶ STARTED ──▶ COMPLETED
+     passenger      system (joined a pool)    driver               driver       driver
+                    or driver (accepted)
+```
+
+The whole rule is one small table in code: **7 allowed (from, to) pairs**, each with the actors allowed to make that move. Anything else gets **409 `INVALID_TRANSITION`**, with a message like `DRIVER_ARRIVED → CANCELLED is not allowed for PASSENGER`.
+
+| From → To | Who may do it | In the story |
+|---|---|---|
+| (new) → REQUESTED | PASSENGER | Nusrat taps "Request" (a new row, so it's not in the table) |
+| REQUESTED → MATCHED | SYSTEM or DRIVER | Nusrat auto-joins Bullet (SYSTEM), or Jashim accepts her offer (DRIVER) |
+| REQUESTED → CANCELLED | PASSENGER or SYSTEM | Nusrat gives up, or the sweeper gives up for her after 180 s (`NO_DRIVER_FOUND`) |
+| MATCHED → DRIVER_ARRIVED | DRIVER | Jashim is at the Banani pickup |
+| MATCHED → CANCELLED | PASSENGER or DRIVER | either side backs out before pickup; the seat is freed |
+| DRIVER_ARRIVED → STARTED | DRIVER | Nusrat is in the car |
+| DRIVER_ARRIVED → CANCELLED | DRIVER only | Nusrat never came out (`PASSENGER_NO_SHOW`) |
+| STARTED → COMPLETED | DRIVER | dropped at Mohakhali |
+
+`COMPLETED` and `CANCELLED` are **final**: nothing leaves them.
+
+### Rules worth noticing
+
+- **Nusrat can't cancel once Jashim has arrived.** He drove there and is waiting, so walking away now counts as a no-show, and only Jashim can record that. (Plan 5.9 step 5 asks for exactly this test.)
+- **Nobody can cancel a started ride.** Once Nusrat is in the car, the only way out is `COMPLETED`. A ride can't be "cancelled" halfway through Dhaka traffic, which would make the fare and the audit meaningless.
+- **Only the driver moves a ride forward** (arrive, start, complete). A passenger can't mark her own ride complete.
+- **No skipping steps**: `MATCHED → STARTED` without "arrived" is refused, so the history always shows the full story.
+- **Repeating a move is refused**: a second "cancel" on a cancelled ride is 409, not silently "OK". (The gateway's idempotency key, Part 2, is what makes a *retried* request safe.)
+
+### Where it's used
+
+Everything after booking goes through **one** function, `lifecycle.transition()` (5.5), which calls `assert_transition()` **before** changing anything. The two ways to become `MATCHED` (auto-join, driver accept) are written as a guarded update instead (`... WHERE status = 'REQUESTED'`), which enforces the same `REQUESTED → MATCHED` row atomically. So the table is the single source of truth for what's allowed, and the code follows it.
+
+The **actor** comes from the gateway's headers: a `DRIVER` role → DRIVER, anything else → PASSENGER, and no user at all (the sweeper) → SYSTEM. The same word is written to the audit (`ride_status_history.actor_role`), whose CHECK rule from 5.3 accepts exactly these three.
+
+### What I did
+
+**`state_machine.py` is the plan's code, unchanged.** It's already minimal and correct, so all the work went into proving it.
+
+### How 5.4 was checked: 123 new tests (197 in total), all passing
+
+`test_state_machine.py`:
+- **The full grid (plan 5.9 step 2):** every status × every status × every actor = **108 cases**. The 10 allowed (from, to, actor) moves pass; the other 98 are refused with `INVALID_TRANSITION` / 409. The allowed list in the test is **written out by hand from the plan's table**, not copied from the code, so a change to either one gets noticed.
+- The story rules above, each as its own named test (no cancelling after arrival, nothing after `COMPLETED`/`CANCELLED`, only the driver moves forward, no skipping, no repeats, unknown status or actor refused).
+- **Every status can be reached** from `REQUESTED` (no dead rows in the table).
+- **It agrees with 5.3:**
+  - `ACTIVE_RIDE_STATUSES` (used by the "one active ride per passenger" index) is **exactly** the statuses that can still move.
+  - The statuses match the database's `ck_ride_status` rule.
+  - The actors match `ck_history_actor`.
+
+  If someone adds a status in one place only, a test fails.
+- **What the phone sees:** through Part 1's real error handler, a refusal comes back as HTTP **409** with `{"error": {"code": "INVALID_TRANSITION", "message": "DRIVER_ARRIVED → CANCELLED is not allowed for PASSENGER"}}` (the `→` arrives intact).
+
+**Break-it checks:**
+
+| Deliberately broke... | Result |
+|---|---|
+| passenger may cancel after the driver arrived | 3 failed |
+| a started ride can be cancelled | 3 failed |
+| passenger can complete a ride | 2 failed |
+| the sweeper can't expire requests | 1 failed |
+| added a shortcut `MATCHED → STARTED` | 3 failed |
+| refusal returns 400 instead of 409 | 99 failed |
+
+---
+
+## 5.5: the core logic
+
+Five files do the actual work. Here's Rafiq's evening, and which file handles each step:
+
+```
+Rafiq taps "Request" (Banani → Gulshan 1)
+ │
+ ├─ clients.py    FareClient: "price this"                     → a quote: distance, solo and pooled price
+ ├─ pooling.py    save the ride as REQUESTED                   (a 2nd active ride → 409 ACTIVE_RIDE_EXISTS)
+ ├─ pooling.py    snapshot of Banani pools that have room      → [Bullet: 3 seats left, version 1, stops]
+ ├─ clients.py    MatchingClient: "does he fit?"               → "Bullet, version 1, plan B·B·G1·M"
+ ├─ pooling.py    try_join: take the seat IF Bullet is still version 1 and has room
+ │                   ├─ yes → MATCHED, stops rewritten, events       (done)
+ │                   └─ no (someone got there first) → ask Matching again, up to 3 times
+ └─ pooling.py    nothing fits → offers to nearby drivers, stays REQUESTED
+                     └─ Jashim accepts → accept_offer: a new pool
+
+Later: arrive / start / complete / cancel  → lifecycle.py   (checks the 5.4 state machine first)
+Nobody accepted in 180 s                  → workers.py     (the sweeper cancels it: NO_DRIVER_FOUND)
+What Matching and the phones are told     → snapshots.py   (pool view + trip.pool.updated)
+```
+
+### `pooling.py`: getting a rider into a car
+
+**`try_join` is the heart of Part 5.** For each pool Matching suggested, in Matching's order, it runs **one** statement:
+
+```sql
+UPDATE pools SET occupied_seats = occupied_seats + :seats, version = version + 1
+WHERE id = :pool AND status = 'FORMING' AND version = :version AND occupied_seats + :seats <= max_capacity
+```
+
+- **1 row changed** → the seat is Rafiq's. In the **same transaction**: his ride becomes `MATCHED`, the stops are rewritten to Matching's plan (with the `__new__` placeholder replaced by his real ride id), the audit gets `REQUESTED → MATCHED` by `SYSTEM`, and two events go into the outbox (`trip.ride.matched`, `trip.pool.updated`).
+- **0 rows** → someone else changed Bullet since Matching looked (a seat went, or the stop order changed). Try the next suggestion. If none work, the answer is **STALE**, and `request_ride` asks Matching again with a fresh snapshot, **at most 3 times**. After that it falls back to offers.
+
+Why it can't overbook (the plan's reasoning, now proven by tests):
+1. `BEGIN IMMEDIATE` (Part 1): only one write transaction runs at a time; the second waits.
+2. The seat check is **inside** the `UPDATE`, so it reads the latest committed number, not a copy from earlier.
+3. `version` also protects the **stop order**: Matching's plan was built for version 1. If Shirin joined in between, the plan is out of date even if a seat is free.
+4. The database CHECK from 5.3 is the last line of defence.
+
+**`accept_offer`**: Jashim accepts Nusrat's offer. Checks, in order: he has an open offer (404), he's online (409), Bullet has enough seats for her party (409), and he has no live pool already (409, the unique index from 5.3). Then it makes a pool **sized from his shift** (4 seats), marks her `MATCHED` **only if she's still `REQUESTED`**, marks the offer `ACCEPTED`, and writes the two stops. If two drivers accept at the same moment, the second gets 409 `RIDE_NO_LONGER_AVAILABLE`, and **his half-made pool is rolled back** too.
+
+### `lifecycle.py`: everything after booking
+
+One function, `transition(ride, target, who)`, used by every arrive / start / complete / cancel, and by the sweeper:
+1. **Load and check ownership.** Nusrat can only touch her own ride. Jashim can only touch rides in **his** pool. Anyone else gets **404, not 403**, so Rafiq can't even find out that Nusrat's ride id exists.
+2. **Check the 5.4 state machine** (409 otherwise).
+3. Change the status (guarded by the ride's `version`), and write the audit row.
+4. **What it does to the pool:**
+   - **STARTED**: pickup marked done. The pool goes `FORMING → IN_PROGRESS`, so it's **closed to new riders** once the first person is in the car.
+   - **CANCELLED**: seats freed, the rider's stops removed, the rest renumbered. **Stops already done stay done.**
+   - **COMPLETED**: seats freed, drop-off marked done.
+   - **No active riders left**: the pool is `COMPLETED` (if anyone finished) or `CANCELLED` (if everyone backed out). Either way **Jashim is free**, and the `trip.pool.updated` event tells Matching so (4.7).
+5. **Events**: `trip.ride.cancelled` / `completed` / `status_changed`, plus `trip.pool.updated` whenever there's a pool.
+
+**`pooled` (what Fare prices on):** a completed ride is "pooled" if its pool had **2 or more rides that weren't cancelled**. Rafiq and Nusrat both finish → both pooled. Rafiq cancels → Nusrat rode alone → **solo fare**.
+
+### `workers.py`: the sweeper
+
+Every 15 s, requests still `REQUESTED` after `RIDE_REQUEST_TTL_SECONDS` (180) are cancelled **through `transition()`** as `SYSTEM` with reason `NO_DRIVER_FOUND`. So they get the same audit row and event as any other cancel, and Nusrat's phone is told. A ride matched at the last moment is skipped (the state machine refuses `MATCHED → CANCELLED` for SYSTEM). If the database hiccups, the error is logged and the loop carries on.
+
+### `snapshots.py` and `clients.py`
+
+- **`snapshots.py`**: builds the pool view (riders, stops with done flags) and the `trip.pool.updated` payload from it, so the phones and Matching see the **same** picture. `replace_waypoints` rewrites the stop list while **keeping done stops done**.
+- **`clients.py`**: `FareClient` gets a new quote, or checks the one the app already has (it must belong to **this** passenger, **this** route and seat count, and not be expired). `MatchingClient` sends the evaluate request. `deps.py` now provides both (as promised in 5.2).
+
+### Two fixes in `clients.py`
+
+| Plan's code | Problem | Fix |
+|---|---|---|
+| only 5xx from Fare/Matching become an error | a **401** (wrong internal token) or **404** is parsed as a quote → **crash, 500**. The same trap Identity hit in Part 3 | anything other than 200/201 (after the 404/422 the code expects) → **503 `UPSTREAM_ERROR`** |
+| `if q.expires_at < datetime.utcnow()` | if Fare ever sends `expires_at` with a timezone (`...Z` or `+06:00`), Python **refuses to compare** a time-with-zone and a time-without → `TypeError`, **500** on every ride request | convert Fare's time to naive UTC first, and use Part 1's `utcnow()` (one clock everywhere) |
+
+### One fix outside Trip's app code: the sweeper's log was silenced in tests
+
+A test that breaks the database on purpose found that the sweeper's "iteration failed" message **never appeared**. The cause: `migrations/env.py` calls Python's `fileConfig(...)`, which by default **switches off every logger that already exists**. Tests run migrations in the same process as the app, so `trip.sweeper` went silent. **Fix:** `fileConfig(..., disable_existing_loggers=False)` in Trip's `env.py`. In Docker, migrations run as a separate command, so production wasn't affected. But a silently-failing sweeper is exactly the kind of thing you want to see in test logs.
+
+(Matching and Identity use the same `env.py` line. Their loggers aren't tested this way, so I left them alone. It's the same one-word change if it's ever needed.)
+
+### What the plan's code does as-is (known limitations, not changed)
+
+- **No candidates → the ride waits 180 s for nothing.** Offers are only sent at request time, so a driver who comes online a minute later is never offered Nusrat's ride, and a pool formed later can't pick her up. The sweeper then cancels her. The plan lists this in 8.7 ("stale `REQUESTED` rides are cancelled, not re-matched"). It's a product decision, so I left it.
+- **"Pooled" is decided when each ride completes.** If Nusrat completes while Rafiq is still `MATCHED` and waiting, she's counted as pooled, even if Rafiq later becomes a no-show. That's rare with same-zone pickups (both are picked up at Banani before anyone is dropped), but possible.
+
+### How 5.5 was checked: 79 new tests (276 in total), all passing
+
+| File | Tests | What |
+|---|---|---|
+| `test_pooling.py` | 21 | the snapshot is exactly what Matching's `OpenPool` expects; **Rafiq joins Bullet** (seats 1→2, version 1→2, stops B·B·G1·M with his real id, audit, 2 events); a stale version changes **nothing**; **no joining once the car has left** (`IN_PROGRESS`), even with the right version; the next suggestion is tried; a ride cancelled mid-matching rolls the seat back; `request_ride`: auto-join, own quote, offers + `trip.ride.requested`, 2nd active ride 409, stale → re-ask, **gives up after exactly 3**; `accept_offer`: all 5 refusals, and a late second driver leaves no pool behind |
+| `test_lifecycle.py` | 13 | **the whole story** (arrive, start closes the pool, Rafiq drops at G1 first, Nusrat last, pool `COMPLETED`, both `pooled`); the audit tells it; **passenger cancel after arrival → 409, nothing changed**; cancel in `MATCHED` frees the seat and the stops (plan 8.5); no-show; last rider out dissolves the pool; Jashim can take a new pool afterwards; `pooled` false when alone or when the co-rider cancelled |
+| `test_ownership.py` | 5 | Rafiq can't cancel Nusrat's ride; Karim can't touch Jashim's riders; a driver can't act on a ride before it's in his pool; **"not yours" looks exactly like "doesn't exist"** |
+| `test_capacity.py` | 5 | plan 8.5's two checks; then **a whole evening**: after **every** step, `occupied_seats` equals the seats of the riders actually booked (fill to 4, disappear from the snapshot, cancel, reopen, start, complete, 0) |
+| `test_concurrency.py` | 3 | **the plan's last-seat race** on a real file (Nusrat vs Shirin: exactly one `joined`, one `stale`, 3 of 3 seats); **10 riders, 1 seat → exactly 1 wins**; two drivers accept the same ride at once → one pool |
+| `test_workers.py` | 5 | old request → `CANCELLED` / `NO_DRIVER_FOUND` / by `SYSTEM`, with event; a young one is kept; matched rides never expire; the whole batch is processed; a broken database is logged and survived, and the loop stops when asked |
+| `test_clients.py` | 24 | with `respx`: quote sent with the internal token and request id; unknown zone; the app's quote (not found, **someone else's / wrong route / wrong seats**, expired); **expiry with `Z` and `+06:00`** (the fix); **400/401/403/404 → 503** (the fix); Fare down / 500; Matching ok / 422 / 401 / down |
+| `test_events_contract.py` | 3 | an evening that produces **all 6 event types**; each has **exactly** the fields in the plan's registry (0.4), since Matching, Fare and Notification depend on them; fixed-width `occurred_at`; done stops stay done when the route changes |
+
+**Break-it checks** (broke the code on purpose, ran all tests, restored):
+
+| Deliberately broke... | Result |
+|---|---|
+| `try_join` without the seat check in its `UPDATE` | 1 failed (the database CHECK would still stop it, but as a crash instead of "try the next pool") |
+| `try_join` without the version check | 3 failed |
+| `try_join` may join an `IN_PROGRESS` pool | **0 failed at first** → added "no joining once the car has left" → now 1 fails |
+| cancel/complete doesn't free seats | 5 failed |
+| no ownership check | 4 failed |
+| 1 attempt instead of 3 | 2 failed |
+| "pooled" counts cancelled co-riders | 1 failed |
+| sweeper expires young requests | 1 failed |
+| client fix reverted: 4xx parsed as a quote | 6 failed |
+| client fix reverted: timezone expiry | 4 failed |
+| accepting doesn't mark the offer `ACCEPTED` | 1 failed |
+
+---
+
 ## Things to know before the next sections
 
 - **Build order:** the plan's recommended order (0.7) builds **Fare's quotes (Part 6) before Trip**, because Trip calls Fare on every request. This project follows the part numbers instead, so Fare doesn't exist yet. That's fine for building and testing Trip (Fare is faked with `respx`), but running Trip for real needs Fare's quote endpoints.
+- **Fare and Matching errors reach the phone as 503** (`UPSTREAM_ERROR` / `UPSTREAM_UNAVAILABLE`), or 422 for zone/quote problems. The ride is **not** created when Fare fails, because the quote comes first.
+- **Every ride status change after booking must go through `lifecycle.transition()`** (5.5), which checks the state machine first. Writing `ride.status = ...` anywhere else would skip the rules.
 - **One data store:** `trip.db` (SQLite). No Redis. Run `alembic upgrade head` before starting (the Dockerfile does).
 - **Changing a CHECK rule needs a hand-written migration** (as in Matching). `test_migrations.py` lists every rule by name, so a missing one fails a test.
 - **Trip is the only writer of seat counts.** Every seat change is a compare-and-set on `pools.version` inside `BEGIN IMMEDIATE`. Matching's answers are only advice.
