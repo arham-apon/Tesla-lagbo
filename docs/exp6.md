@@ -6,8 +6,8 @@
 |---|---|---|
 | 6.1 | Overview & domain scope | **Done** (explained below) |
 | 6.2 | Fare model (the formula, hand-checkable) | **Done** (explained below) |
-| 6.3 | Directory structure | Not started |
-| 6.4 | Data layer (tariff, quotes, fares, wallets) + pricing + distance cache | Not started |
+| 6.3 | Directory structure | **Done** (explained below) |
+| 6.4 | Data layer (tariff, quotes, fares, wallets) + pricing + distance cache | **Done** (explained below) |
 | 6.5 | API endpoints | Not started |
 | 6.6 | Messaging (settling a ride) | Not started |
 | 6.7 | Step-by-step build + tests | Not started |
@@ -183,15 +183,167 @@ The model is a formula with no code of its own (the code, `pricing.py`, comes in
 
 ## Found while reading ahead (to fix in the right section)
 
-**1. Pickup = drop-off would be priced at ৳30 (6.5).** Matching's distance for the same zone is **0 m**, so an estimate for Banani → Banani would quote the base fare. Trip already refuses this (5.3), but `POST /fares/estimate` is also called directly by the app. Fare's request shape needs the same "must differ" rule.
+**1. Pickup = drop-off would be priced at ৳30 (6.5).** *Half done in 6.4: the database now refuses such a quote. The friendly 422 at the door comes with the request shape in 6.5.* Matching's distance for the same zone is **0 m**, so an estimate for Banani → Banani would quote the base fare. Trip already refuses this (5.3), but `POST /fares/estimate` is also called directly by the app. Fare's request shape needs the same "must differ" rule.
 
 **2. `quotes.voided` is written but never read (6.5/6.6).** When Trip cancels a ride, settlement marks the quote `voided`, but `GET /internal/quotes/{id}` doesn't look at it. So Nusrat could cancel, then request again with the **same** quote within its 10 minutes, and Trip would accept it. It's harmless for money (each ride settles once, on its own `ride_id`), but then "voided" means nothing. I'll decide in 6.5: either refuse voided quotes, or drop the flag.
 
 **3. A missing quote or tariff crashes settlement (6.6).** `quote = await s.get(Quote, ...)` then `quote.tariff_id`: an unknown `quote_id` gives `AttributeError`. The bus then retries 3 times and dead-letters it, which is the right outcome, but with a confusing error message. A clear error will make the dead-letter queue readable.
 
-**4. `REFUNDED` is allowed but nothing produces it (6.4).** The `fares` status rule accepts `PAID / FAILED / REFUNDED`; there's no refund flow in the plan. It's harmless, and leaves room for one later. I'll keep it and say so.
+**4. `REFUNDED` is allowed but nothing produces it (6.4).** The `fares` status rule accepts `PAID / FAILED / REFUNDED`; there's no refund flow in the plan. It's harmless, and leaves room for one later. *Kept as is in 6.4.*
 
 **5. Trip's test fakes use made-up prices (Part 5).** Trip's `FakeFare` quotes 11000 / 8800, and the 5.8 end-to-end test settles ৳105.00. They're only fakes, so nothing is wrong, but once Fare exists the tests would read better with the real 8250 / 7200. Optional tidy-up, later.
+
+---
+
+## 6.3: the directory structure
+
+### What I created
+
+```
+services/fare/
+├── Dockerfile                  generic service Dockerfile, port 8004
+├── requirements.txt            uvicorn + alembic
+├── requirements-dev.txt        pytest, pytest-asyncio, fakeredis (the distance cache), respx (fake Matching)
+├── pytest.ini
+├── alembic.ini
+├── migrations/
+│   ├── env.py                  same as Trip's (including the "don't silence loggers" fix from 5.5)
+│   └── versions/
+│       ├── 0001_init.py        all 7 tables (6.4)
+│       └── 0002_seed_tariff.py tariff v1: 3000 / 1500 / 20 (6.4, plan step 6.7.1)
+├── app/
+│   ├── __init__.py
+│   ├── config.py               settings
+│   ├── deps.py                 db, auth, bus, redis, matching_http, settings
+│   ├── models.py               tables (6.4)
+│   ├── pricing.py              compute() (6.4)
+│   ├── distance.py             Matching + Redis cache (6.4)
+│   ├── schemas.py              placeholder: request/response shapes, code in 6.5
+│   ├── settlement.py           placeholder: settling a ride, code in 6.6
+│   ├── seed.py                 placeholder: demo wallets, code in 6.7
+│   ├── main.py                 placeholder: app + lifespan, code in 6.7
+│   └── routers/
+│       ├── __init__.py
+│       ├── fares.py            placeholder: /fares/estimate, /fares/rides/{id}
+│       ├── wallet.py           placeholder: /wallet, /wallet/topup
+│       ├── driver.py           placeholder: /driver/earnings
+│       └── internal.py         placeholder: /internal/quotes (Trip)
+└── tests/                      (6.4, see below)
+```
+
+### How the files map to 6.1's jobs
+
+| 6.1 job | File |
+|---|---|
+| the price list | `models.py` (`tariffs`), `0002_seed_tariff.py` |
+| the formula | `pricing.py` |
+| distances (from Matching, cached) | `distance.py` |
+| quotes | `models.py` (`quotes`), `routers/fares.py` + `routers/internal.py` |
+| the ledger + wallets | `models.py`, `settlement.py` |
+| driver earnings | `routers/driver.py` (worked out from the ledger) |
+
+As in Matching and Trip, routers are split **by who calls them**, so each file has one security rule.
+
+### Decisions
+
+| Plan says | What I did | Why |
+|---|---|---|
+| no `__init__.py`, no `tests/`, no `pytest.ini`, no `requirements-dev.txt` in the folder list | added them | the same as Parts 3–5 |
+| migration env | **copied Trip's** `env.py`, `alembic.ini`, `script.py.mako` | same proven setup, and it already has 5.5's logger fix |
+| (no `config.py` contents given) | `DB_PATH` (`fare.db`), `REDIS_URL`, `RABBITMQ_URL`, `INTERNAL_TOKEN` (required), `MATCHING_URL`, **`QUOTE_TTL_SECONDS=600`**, `LOG_LEVEL` | the plan says quotes "expire in 10 min"; a setting keeps that number in one place |
+| `deps.py` | `db`, `auth`, `bus`, **`redis`** (the distance cache) and **`matching_http`** | what plan step 6.7.7's lifespan needs |
+
+**For 6.7:** the Dockerfile runs `alembic upgrade head` then `uvicorn`. When `seed.py` is written (demo wallets), the Dockerfile will need the `python -m app.seed` step in between, like Identity's.
+
+---
+
+## 6.4: the data layer
+
+### Seven tables
+
+| Table | One row is... | Rules the **database** enforces |
+|---|---|---|
+| `tariffs` | a price list | no negative prices; discount 0–100 %; **only one active** (**added**) |
+| `quotes` | a promised price | 1–6 seats; the tariff must exist; **pickup ≠ drop-off**, **distance > 0**, **0 ≤ pooled ≤ solo** (**added**) |
+| `fares` | a settled ride (ledger line) | **total = base + distance − discount**; total ≥ 0; `CASH`/`WALLET`; `PAID`/`FAILED`/`REFUNDED`; **one per ride**; its quote must exist; **no negative parts, 1–6 seats, and a discount only if pooled** (**added**) |
+| `wallets` | a TeslaPay balance | **never below zero** |
+| `wallet_transactions` | one money movement | `TOPUP`/`RIDE_DEBIT`/`DRIVER_CREDIT`; never 0; **one of each kind per ride per person** (no double debit); the wallet must exist; **the sign matches the kind**, and **ride money names its ride** (**added**) |
+| `outbox`, `processed_events` | outgoing events / events already handled | Part 1's mixins, unchanged |
+
+### The one-line rules that make money safe
+
+**`total_poysha = base_poysha + distance_charge_poysha − pool_discount_poysha`** (the plan's). A fare that doesn't add up **can't be saved**. Since the formula works per seat and then multiplies (6.2), the rule holds for 2-seat fares too.
+
+**`balance_poysha >= 0`** (the plan's). Settlement takes money with `UPDATE ... WHERE balance >= total`. If the wallet is short, 0 rows change and the payment is `FAILED` (6.6). Even if that check were forgotten, the database would refuse to let Nusrat's balance go negative.
+
+**`UNIQUE (ride_id, kind, user_id)`** (the plan's). Nusrat can be debited for ride 1 **once**. A replayed event can't charge her twice, even if every other guard failed. Top-ups have no ride id, and SQLite treats each empty ride id as different, so she can top up as often as she likes.
+
+### What I added, and why
+
+| Added rule | Why |
+|---|---|
+| **only one active tariff** (a partial unique index, like Trip's) | an estimate uses "the active tariff". With two, the price would depend on which row the database happened to return. Changing prices = retire tariff 1 and add tariff 2 **in one transaction** (a test does exactly that). Tariff 1 stays, because old quotes point at it |
+| quote: **pickup ≠ drop-off**, **distance > 0** | finding 1 from 6.2: Matching says 0 m for the same zone, which would quote the bare ৳30 base |
+| quote: **0 ≤ pooled ≤ solo** | a quote that shows pooling as **dearer** would be a pricing bug; the database won't store one |
+| fare: **a discount only if pooled** | the ledger must never show a pool discount on a solo ride. That's exactly the kind of mistake an auditor looks for |
+| fare: **no negative parts**, **1–6 seats** | without it, a "discount" of −1050 would still satisfy the arithmetic rule (3000 + 5250 − (−1050) = 9300). A test proves the gap is closed |
+| transaction: **sign matches kind** | a `RIDE_DEBIT` that **gives** money, or a `TOPUP` that **takes** it, is refused |
+| transaction: **ride money names its ride; top-ups don't** | a debit without a ride id would escape the "no double debit" rule (empty ride ids never clash) |
+
+All of these are **cheap for correct code and fatal for wrong code**: the plan's settlement (6.6) already writes rows that satisfy every one of them.
+
+### `pricing.py`, as in the plan
+
+`compute(tariff, distance_m, seats, pooled)` → base, distance charge, discount and total, **totals for all seats**. It's pure arithmetic in whole poysha: no database, no clock. It's used twice per quote (solo and pooled) and once at settlement.
+
+### `distance.py`: two fixes
+
+| Plan's code | Problem | Fix |
+|---|---|---|
+| only 422 from Matching is handled | a **401** (wrong token) or **404** reaches `resp.json()["distance_m"]` → **crash, 500**. The same trap as Trip's clients (5.5) and Identity (Part 3) | anything but 200 → **503 `UPSTREAM_ERROR`** |
+| `await redis.get(...)` / `set(...)` unguarded | the cache only **saves a call**, yet a Redis outage would make **every estimate fail** | cache errors are logged and skipped; the price comes straight from Matching |
+
+The rest is the plan's: key `fare:dist:{from}:{to}`, 24 h, one retry for Matching (it's a GET, so a retry is safe).
+
+### Migrations
+
+- **`0001_init.py`**: autogenerated from the models, then **hand-checked**: all 18 CHECK rules, the plan's and mine, plus the `WHERE active = 1` of the one-active index (the same autogenerate risk as Trip's, 5.3).
+- **`0002_seed_tariff.py`**: tariff 1 = 3000 / 1500 / 20, active (plan step 6.7.1). Like Matching's zone seed, the numbers are **written out** in the migration, not imported from the app. It also says how to change prices later: a new migration adds tariff 2 and retires tariff 1, but never deletes it.
+
+### How 6.3 and 6.4 were checked: 77 tests, all passing
+
+| File | Tests | What |
+|---|---|---|
+| `test_pricing.py` | 21 | **the plan's three rows: 7200, 5400, 8250** (plan step 6.7.2, the PRD's "pooled fares calculate correctly"); 2 seats = 14,400; **total = its parts for every distance from 100 m to 30 km × 1–6 seats × pooled or not**; pooled never dearer and never below the base; the discount is only on the km part; a future ৳17/km tariff **rounds down, never up**; whole poysha always; 0 % and 100 % discount tariffs |
+| `test_migrations.py` | 6 | exactly the 7 tables; every rule by name; the one-active index keeps its `WHERE`; **tariff v1 is seeded**; models and migration agree; downgrade step by step and back |
+| `test_models.py` | 41 | every rule above: bad tariffs; **a second active tariff refused, but "retire 1, add 2" works**; bad quotes (incl. **same zone**, **0 m**, **pooled dearer than solo**, unknown tariff); Nusrat's ৳72 fare; fares that **don't add up**, **discount on a solo ride**, **negative discount**, bad seats/method/status, unknown quote; one fare per ride; a 2-seat fare adds up; **a wallet can't go below zero**; money moves the right way (and 8 ways it can't); **no double debit**; many top-ups are fine |
+| `test_distance.py` | 9 | asks Matching (token, request id, from/to) and **caches for 24 h**; the second ask doesn't call Matching; each direction is its own entry; unknown zone → 422, nothing cached; **401/404 → 503**; Matching down → 503; **a timeout is retried once**; **Redis down still gives a price** |
+
+Every module (including the placeholders) imports, and `config.py` gives the defaults above.
+
+Run them with:
+
+```
+cd services\fare
+..\..\.venv\Scripts\python -m pytest
+```
+
+**Break-it checks** (broke the migration or code on purpose, ran all tests, restored):
+
+| Deliberately broke... | Result |
+|---|---|
+| same-zone quote allowed | 2 failed |
+| discount on a solo ride allowed | 2 failed |
+| money sign not checked | 4 failed |
+| fare arithmetic not checked | 2 failed |
+| wallet may go negative | 2 failed |
+| one-active index loses its `WHERE` | 1 failed |
+| pricing: discount on the base too | 7 failed |
+| pricing: rounds **up** instead of down | 1 failed |
+| pricing: seats ignored | 11 failed |
+| distance: no cache | 1 failed |
+| distance: 401/404 fix reverted | 2 failed |
+| distance: Redis errors fatal again | 1 failed |
 
 ---
 
@@ -200,5 +352,7 @@ The model is a formula with no code of its own (the code, `pricing.py`, comes in
 - **Build order:** the plan's recommended order (0.7) builds Fare's **quotes** before Trip and **settlement** after. This project did Trip first, with Fare faked, so both halves come now.
 - **Data stores:** `fare.db` (SQLite: tariff, quotes, fares, wallets) and **Redis** (the 24 h distance cache only).
 - **Money is whole poysha everywhere.** No floats, ever.
+- **Changing prices** = a new migration: add tariff 2 as active, retire tariff 1 (never delete it). The one-active rule makes a half-done change impossible.
+- **Changing a CHECK rule needs a hand-written migration** (as in Matching and Trip). `test_migrations.py` lists every rule by name.
 - **The fare row is a ledger line:** written once, never updated.
 - **Settlement is driven by Trip's event, not a call**, so it has to be safe to receive twice (the plan uses three layers for that, 6.6).
