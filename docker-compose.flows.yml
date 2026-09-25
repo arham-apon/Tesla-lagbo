@@ -1,0 +1,7 @@
+# Test-only override for scripts/flows.py: a stale ride request expires after 20 s instead of 180 s, so the
+# "nobody accepted" flow can be tested without waiting 3 minutes. Everything else is the normal stack.
+#   docker compose -f docker-compose.yml -f docker-compose.flows.yml up -d
+services:
+  trip:
+    environment:
+      RIDE_REQUEST_TTL_SECONDS: "20"
