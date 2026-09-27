@@ -1,0 +1,6 @@
+# Test-only dependencies (not installed in the Docker image).
+-r requirements.txt
+pytest~=9.1
+pytest-asyncio~=1.4
+respx~=0.23
+pytest-repeat~=0.9

@@ -217,3 +217,11 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 .claude/
+
+# Dhaka Tesla Pool: JWT key pair (never commit private keys)
+keys/
+
+# SQLite databases (one per service; never commit)
+*.db
+*.db-wal
+*.db-shm

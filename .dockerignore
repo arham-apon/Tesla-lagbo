@@ -1,0 +1,14 @@
+# Build context is the repo root; send only what the Dockerfiles COPY.
+.git
+.venv
+keys
+.env
+docs
+**/__pycache__
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/tests
+**/.pytest_cache
+**/pytest.ini
+**/requirements-dev.txt

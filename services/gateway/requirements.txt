@@ -1,0 +1,2 @@
+# tesla-common (libs/common) is installed by the Dockerfile; locally: pip install -e libs/common
+uvicorn[standard]~=0.30

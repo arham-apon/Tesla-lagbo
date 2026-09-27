@@ -1,0 +1,2 @@
+never add git as a contributor
+follow this rule strictly
