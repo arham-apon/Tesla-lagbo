@@ -1,0 +1,31 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    @apply bg-canvas text-fg-primary font-sans antialiased;
+    color-scheme: dark;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    @apply bg-canvas text-body-md min-h-screen;
+  }
+
+  /* One focus language everywhere: 2px mint ring offset 2px (WCAG 2.4.7). */
+  :focus-visible {
+    @apply outline outline-2 outline-offset-2 outline-mint;
+  }
+}
+
+/* Safety net for anything not driven by Framer Motion (which gets reducedMotion="user"). */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+}
