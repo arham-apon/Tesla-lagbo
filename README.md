@@ -2,7 +2,7 @@
 
 **Share a seat. Split the fare. Survive Dhaka traffic.**
 
-> ## 🎥 Demo video (6 min): **[Watch on Loom](https://www.loom.com/share/REPLACE_WITH_YOUR_LINK)**
+> ## 🎥 Demo video (6 min): **https://drive.google.com/drive/folders/14QkyMyGZDYnHNWCsIvwUyB2T4_il_ZzX?usp=sharing**
 > 🌐 **Deployment:** no public URL. See [Deployment](#deployment) for why, and for the one-command reproducible Docker deployment.
 
 Dhaka Tesla Pool is a ride-pooling MVP. It uses the PRD's story cast throughout: seed data, tests, demo and this README.
