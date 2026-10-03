@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Tesla-Lagbo · Engineering</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --canvas: #0B0F17; --raised: #111827; --elevated: #1E293B; --interactive: #253349;
+    --line: rgba(255,255,255,.08); --line-strong: rgba(255,255,255,.2);
+    --fg: #F9FAFB; --fg2: #94A3B8; --fg3: #64748B;
+    --mint: #10B981; --mint-subtle: rgba(16,185,129,.12); --amber: #F59E0B; --amber-subtle: rgba(245,158,11,.12);
+    --coral: #EF4444; --coral-text: #F87171; --coral-subtle: rgba(239,68,68,.12); --blue: #60A5FA; --blue-subtle: rgba(96,165,250,.12);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 1920px; height: 1080px; overflow: hidden; background: var(--canvas); color: var(--fg); font-family: Inter, "Segoe UI", system-ui, sans-serif; }
+  pre, code, .mono, .tbl li, .st, .tl .n, .tl .db, .lane p, .file { font-variant-ligatures: none; font-feature-settings: "calt" 0, "liga" 0; }
+  .mono { font-family: "JetBrains Mono", Consolas, monospace; }
+  body::before { content: ""; position: fixed; inset: 0; background-image: linear-gradient(var(--line) 1px, transparent 1px), linear-gradient(90deg, var(--line) 1px, transparent 1px); background-size: 64px 64px; opacity: .35; pointer-events: none; }
+  .slide { position: absolute; left: 330px; top: 0; width: 1260px; height: 1080px; padding: 72px 0 60px; display: flex; flex-direction: column; gap: 28px; opacity: 0; transform: translateY(16px); transition: opacity .6s ease, transform .6s ease; pointer-events: none; }
+  .slide.on { opacity: 1; transform: none; }
+  .kicker { font-size: 18px; letter-spacing: .14em; text-transform: uppercase; color: var(--mint); font-weight: 700; display: flex; gap: 14px; align-items: center; }
+  .kicker .n { color: var(--fg2); font-weight: 600; }
+  h1 { font-size: 52px; line-height: 1.1; font-weight: 800; letter-spacing: -.01em; }
+  h1 em { font-style: normal; color: var(--mint); }
+  .lead { font-size: 24px; line-height: 1.45; color: var(--fg2); max-width: 1100px; }
+  .card { background: var(--raised); border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 4px 20px -2px rgba(0,0,0,.5); }
+  .row { display: flex; gap: 24px; }
+  .col { display: flex; flex-direction: column; gap: 16px; }
+  .chip { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--line-strong); border-radius: 999px; padding: 6px 14px; font-size: 16px; color: var(--fg2); background: var(--elevated); }
+  .chip.mint { border-color: var(--mint); color: var(--mint); background: var(--mint-subtle); }
+  .chip.amber { border-color: var(--amber); color: var(--amber); background: var(--amber-subtle); }
+  .chip.coral { border-color: var(--coral); color: var(--coral-text); background: var(--coral-subtle); }
+  .hl { outline: 3px solid var(--amber); outline-offset: 4px; border-radius: 12px; transition: outline-color .3s; }
+  .pulse { animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(16,185,129,.0);} 50% { box-shadow: 0 0 0 10px rgba(16,185,129,.18);} }
+
+  /* flow (slide 1) */
+  .flow { display: grid; grid-template-columns: 560px 1fr; gap: 40px; }
+  .flow-steps { display: flex; flex-direction: column; align-items: stretch; }
+  .fstep { display: flex; align-items: center; gap: 18px; padding: 16px 22px; border-radius: 14px; background: var(--raised); border: 1px solid var(--line-strong); }
+  .fstep b { font-size: 23px; }
+  .fstep span { font-size: 17px; color: var(--fg2); }
+  .fstep .ic { width: 44px; height: 44px; border-radius: 10px; display: grid; place-items: center; background: var(--mint-subtle); color: var(--mint); font-weight: 800; font-size: 20px; flex-shrink: 0; }
+  .farrow { height: 30px; display: grid; place-items: center; color: var(--mint); font-size: 22px; }
+  .flow-notes { display: flex; flex-direction: column; gap: 18px; justify-content: center; }
+  .note { padding: 20px 24px; }
+  .note h3 { font-size: 22px; margin-bottom: 8px; }
+  .note p { font-size: 19px; line-height: 1.5; color: var(--fg2); }
+  .note code, .lead code, p code, li code { font-family: "JetBrains Mono", Consolas, monospace; color: var(--fg); background: var(--elevated); padding: 1px 7px; border-radius: 6px; font-size: .9em; }
+
+  /* architecture svg */
+  svg text { font-family: Inter, "Segoe UI", sans-serif; }
+  .node rect { fill: var(--raised); stroke: var(--line-strong); stroke-width: 1.5; }
+  .node .t { fill: var(--fg); font-size: 22px; font-weight: 700; }
+  .node .s { fill: var(--fg2); font-size: 16px; }
+  .node.mint rect { stroke: var(--mint); fill: #0f1f1c; }
+  .node.amber rect { stroke: var(--amber); fill: #1f1a0d; }
+  .node.coral rect { stroke: var(--coral); fill: #221012; }
+  .node.blue rect { stroke: var(--blue); fill: #0f1a2a; }
+  .edge { stroke: var(--fg3); stroke-width: 2; fill: none; }
+  .edge.m { stroke: var(--mint); }
+  .edge.c { stroke: var(--coral); }
+  .edge.d { stroke-dasharray: 7 6; }
+  .elabel { fill: var(--fg2); font-size: 15px; }
+
+  /* legend grid */
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  .mini { padding: 18px 20px; }
+  .mini h4 { font-size: 19px; margin-bottom: 6px; display: flex; gap: 10px; align-items: center; }
+  .mini p { font-size: 17px; line-height: 1.45; color: var(--fg2); }
+
+  /* code */
+  pre.code { font-family: "JetBrains Mono", Consolas, monospace; font-size: 19px; line-height: 1.55; padding: 22px 26px; background: #0d1320; border: 1px solid var(--line-strong); border-radius: 14px; color: #CBD5E1; white-space: pre; overflow: hidden; }
+  pre.code .k { color: #C084FC; } pre.code .f { color: #60A5FA; } pre.code .s { color: #FBBF24; } pre.code .c { color: #64748B; } pre.code .g { color: var(--mint); font-weight: 600; }
+  pre.code .mark { background: rgba(245,158,11,.16); outline: 1px solid rgba(245,158,11,.5); border-radius: 4px; }
+  .file { font-family: "JetBrains Mono", Consolas, monospace; font-size: 16px; color: var(--fg2); margin-bottom: 8px; display: flex; gap: 10px; align-items: center; }
+  .file::before { content: ""; width: 10px; height: 10px; border-radius: 2px; background: var(--mint); }
+
+  /* erd */
+  .erd { display: grid; grid-template-columns: 1fr 1fr; gap: 22px 60px; position: relative; }
+  .tbl { overflow: hidden; }
+  .tbl .th { padding: 12px 18px; background: var(--elevated); font-weight: 700; font-size: 20px; display: flex; justify-content: space-between; align-items: center; }
+  .tbl .th small { font-weight: 500; font-size: 14px; color: var(--fg2); }
+  .tbl ul { list-style: none; padding: 10px 18px 14px; display: flex; flex-direction: column; gap: 5px; }
+  .tbl li { font-family: "JetBrains Mono", Consolas, monospace; font-size: 16px; color: #CBD5E1; display: flex; justify-content: space-between; gap: 12px; }
+  .tbl li i { font-style: normal; color: var(--fg3); font-size: 14px; }
+  .tbl li.key { color: var(--amber); }
+  .tbl.trip { border-color: var(--mint); }
+
+  /* lifecycle */
+  .states { display: flex; align-items: center; gap: 0; }
+  .st { padding: 16px 20px; border-radius: 12px; border: 2px solid var(--line-strong); background: var(--raised); font-family: "JetBrains Mono", Consolas, monospace; font-weight: 600; font-size: 18px; white-space: nowrap; }
+  .st.a { border-color: var(--amber); } .st.m { border-color: var(--mint); } .st.b { border-color: var(--blue); } .st.x { border-color: var(--coral); color: var(--coral-text); }
+  .arr { flex: 1; min-width: 40px; display: flex; flex-direction: column; align-items: center; color: var(--fg3); font-size: 14px; }
+  .arr::after { content: "→"; font-size: 24px; color: var(--fg2); line-height: 1; }
+  .timeline { display: grid; grid-template-columns: repeat(7, 1fr); gap: 10px; }
+  .tl { padding: 14px 14px 16px; border-radius: 12px; background: var(--raised); border: 1px solid var(--line-strong); position: relative; }
+  .tl .n { font-family: "JetBrains Mono", Consolas, monospace; color: var(--mint); font-size: 15px; font-weight: 600; }
+  .tl b { display: block; font-size: 18px; margin: 4px 0 6px; line-height: 1.25; }
+  .tl p { font-size: 15px; color: var(--fg2); line-height: 1.4; }
+  .tl .db { margin-top: 8px; font-family: "JetBrains Mono", Consolas, monospace; font-size: 13px; color: var(--amber); }
+
+  .race { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .lane { padding: 16px 20px; border-radius: 12px; border: 2px solid var(--line-strong); background: var(--raised); }
+  .lane.win { border-color: var(--mint); } .lane.lose { border-color: var(--coral); }
+  .lane h4 { font-size: 19px; margin-bottom: 6px; }
+  .lane p { font-size: 16px; color: var(--fg2); line-height: 1.45; font-family: "JetBrains Mono", Consolas, monospace; }
+
+  .scale { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+  .scale .card { padding: 26px 28px; }
+  .scale h3 { font-size: 26px; margin-bottom: 14px; display: flex; gap: 12px; align-items: center; }
+  .scale ul { list-style: none; display: flex; flex-direction: column; gap: 12px; }
+  .scale li { font-size: 20px; line-height: 1.45; color: var(--fg2); padding-left: 30px; position: relative; }
+  .scale li::before { position: absolute; left: 0; top: 0; font-weight: 800; }
+  .pro li::before { content: "✓"; color: var(--mint); }
+  .con li::before { content: "!"; color: var(--amber); left: 8px; }
+  .quote { font-size: 27px; line-height: 1.45; padding: 26px 32px; border-left: 5px solid var(--mint); background: var(--mint-subtle); border-radius: 0 14px 14px 0; }
+  .quote b { color: var(--mint); }
+</style>
+</head>
+<body>
+
+<!-- 1 · Tap to seat -->
+<section class="slide" id="s1">
+  <div class="kicker">Part 2 · Engineering <span class="n">01 / 09</span></div>
+  <h1>From a tap to a <em>seat</em>: how a request moves</h1>
+  <div class="flow">
+    <div class="flow-steps">
+      <div class="fstep" id="f-user"><div class="ic">1</div><div><b>User</b><br><span>Passenger taps Reserve · driver taps Accept</span></div></div>
+      <div class="farrow">↓</div>
+      <div class="fstep" id="f-fe"><div class="ic">2</div><div><b>Frontend</b> · Next.js + TypeScript<br><span>Passenger console & driver cockpit</span></div></div>
+      <div class="farrow">↓ HTTPS /api/v1</div>
+      <div class="fstep" id="f-gw"><div class="ic">3</div><div><b>API Gateway</b> → Trip service<br><span>JWT check · rate limit · idempotency key</span></div></div>
+      <div class="farrow">↓</div>
+      <div class="fstep" id="f-db"><div class="ic">4</div><div><b>Database</b> · trip.db (SQLite, WAL)<br><span>one write transaction per command</span></div></div>
+      <div class="farrow">↓</div>
+      <div class="fstep" id="f-state"><div class="ic">5</div><div><b>Ride / Pool state</b><br><span>REQUESTED → MATCHED … · FORMING → IN_PROGRESS</span></div></div>
+      <div class="farrow">↓ outbox → RabbitMQ → WebSocket</div>
+      <div class="fstep" id="f-upd"><div class="ic">6</div><div><b>Passenger & driver updates</b><br><span>live push + inbox to catch up after reconnect</span></div></div>
+    </div>
+    <div class="flow-notes">
+      <div class="card note"><h3>One direction, one owner</h3><p>Every change to a ride goes through the <b>Trip</b> service. It is the only writer of rides and pools, so there is exactly one place that decides who gets a seat.</p></div>
+      <div class="card note"><h3>State change and event commit together</h3><p>The new state and its event (<code>trip.ride.matched</code>, <code>trip.pool.updated</code>) are written to <code>outbox</code> in the <b>same transaction</b>. A relay publishes them, so an update can't be lost if the broker is down.</p></div>
+      <div class="card note"><h3>Both sides see it</h3><p>The Notification service turns events into WebSocket pushes: Nusrat sees <i>Matched</i> at the same moment Jashim's manifest shows her seat.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- 2 · Architecture -->
+<section class="slide" id="s2">
+  <div class="kicker">Part 2 · Engineering <span class="n">02 / 09</span></div>
+  <h1>Backend: six FastAPI services, <em>one job each</em></h1>
+  <svg width="1260" height="560" viewBox="0 0 1260 560">
+    <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#94A3B8"/></marker>
+      <marker id="am" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#10B981"/></marker>
+      <marker id="ac" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#EF4444"/></marker></defs>
+    <g class="node blue" id="a-client"><rect x="0" y="222" width="190" height="96" rx="14"/><text class="t" x="95" y="264" text-anchor="middle">Clients</text><text class="s" x="95" y="292" text-anchor="middle">Next.js web app</text></g>
+    <g class="node mint" id="a-gw"><rect x="250" y="206" width="220" height="128" rx="14"/><text class="t" x="360" y="248" text-anchor="middle">API Gateway</text><text class="s" x="360" y="276" text-anchor="middle">JWT (RS256) · rate limit</text><text class="s" x="360" y="300" text-anchor="middle">idempotency keys</text></g>
+    <g class="node" id="a-id"><rect x="560" y="10" width="300" height="80" rx="12"/><text class="t" x="580" y="46">Identity</text><text class="s" x="580" y="72">users · drivers · vehicles · JWT</text></g>
+    <g class="node" id="a-mt"><rect x="560" y="116" width="300" height="80" rx="12"/><text class="t" x="580" y="152">Matching</text><text class="s" x="580" y="178">9 zones · distances · 140% planner</text></g>
+    <g class="node amber" id="a-trip"><rect x="560" y="222" width="300" height="96" rx="12"/><text class="t" x="580" y="258">Trip</text><text class="s" x="580" y="284">rides · pools · state machine</text><text class="s" x="580" y="306">seat locking</text></g>
+    <g class="node" id="a-fare"><rect x="560" y="344" width="300" height="80" rx="12"/><text class="t" x="580" y="380">Fare</text><text class="s" x="580" y="406">quotes · fares · TeslaPay wallet</text></g>
+    <g class="node" id="a-ns"><rect x="560" y="450" width="300" height="80" rx="12"/><text class="t" x="580" y="486">Notification</text><text class="s" x="580" y="512">WebSocket push + inbox</text></g>
+    <g class="node coral" id="a-mq"><rect x="990" y="150" width="260" height="96" rx="14"/><text class="t" x="1120" y="190" text-anchor="middle">RabbitMQ</text><text class="s" x="1120" y="218" text-anchor="middle">events · retry · dead-letter</text></g>
+    <g class="node" id="a-redis"><rect x="990" y="330" width="260" height="96" rx="14"/><text class="t" x="1120" y="370" text-anchor="middle">Redis</text><text class="s" x="1120" y="398" text-anchor="middle">rate limits · GPS pub/sub</text></g>
+    <path class="edge m" d="M190,270 L248,270" marker-end="url(#am)"/>
+    <text class="elabel" x="200" y="258">REST</text>
+    <path class="edge" d="M470,250 L558,50" marker-end="url(#ah)"/>
+    <path class="edge" d="M470,260 L558,156" marker-end="url(#ah)"/>
+    <path class="edge m" d="M470,270 L558,270" marker-end="url(#am)"/>
+    <path class="edge" d="M470,285 L558,384" marker-end="url(#ah)"/>
+    <path class="edge d" d="M95,318 C120,500 380,520 558,490" marker-end="url(#ah)"/>
+    <text class="elabel" x="210" y="470">WebSocket (live status)</text>
+    <path class="edge c" d="M860,50 L988,180" marker-end="url(#ac)"/>
+    <path class="edge c" d="M860,270 L988,210" marker-end="url(#ac)"/>
+    <path class="edge c" d="M860,384 L988,236" marker-end="url(#ac)"/>
+    <path class="edge c d" d="M988,230 C940,420 900,470 862,490" marker-end="url(#ac)"/>
+    <path class="edge d" d="M860,156 L988,360" marker-end="url(#ah)"/>
+    <path class="edge" d="M700,318 L700,342" marker-end="url(#ah)"/>
+    <path class="edge" d="M740,222 L740,198" marker-end="url(#ah)"/>
+    <text class="elabel" x="752" y="336">quote</text>
+    <text class="elabel" x="752" y="214">evaluate</text>
+  </svg>
+  <div class="grid3">
+    <div class="card mini"><h4><span class="chip">HTTP</span></h4><p>When the caller needs an answer now: Trip asks Fare for a price and Matching for a route plan.</p></div>
+    <div class="card mini"><h4><span class="chip coral">RabbitMQ</span></h4><p>When a service announces a fact: <code>trip.ride.completed</code> → Fare settles, Notification pushes.</p></div>
+    <div class="card mini"><h4><span class="chip">Redis</span></h4><p>Short-lived, high-frequency data: GPS pings, rate-limit counters, logout denylist.</p></div>
+  </div>
+</section>
+
+<!-- 3 · Frontend -->
+<section class="slide" id="s3">
+  <div class="kicker">Part 2 · Engineering <span class="n">03 / 09</span></div>
+  <h1>Frontend: Next.js, driven by <em>one status value</em></h1>
+  <div class="row">
+    <div class="col" style="flex: 0 0 560px">
+      <div class="file">frontend/src</div>
+<pre class="code"><span class="f">app/</span>                <span class="c">Next.js App Router shell</span>
+<span class="f">components/</span>
+  passenger/        <span class="c">console, seat picker, fare</span>
+  driver/           <span class="c">cockpit, offers, stop pipeline</span>
+  dispatch/         <span class="c">CabinSeatManifest</span>
+<span class="f">domain/</span>
+  <span class="g">lifecycle.ts</span>      <span class="c">canTransition()</span>
+  money.ts          <span class="c">integer poysha</span>
+<span class="f">sim/</span>
+  <span class="g">world.ts</span>          <span class="c">pooling rules</span>
+  engine.ts         <span class="c">async commands</span>
+<span class="f">design/tokens.ts</span>    <span class="c">every colour & size</span></pre>
+    </div>
+    <div class="col" style="flex: 1">
+      <div class="card note"><h3>Views derive from one lifecycle status</h3><p>No <code>isLoading</code> / <code>isMatched</code> flags. The UI reads a single <code>RideLifecycleStatus</code>, and every change goes through <code>canTransition()</code>, which mirrors the backend's transition table.</p></div>
+      <div class="card note"><h3>Commands, not direct state edits</h3><p>Buttons call async commands such as <code>reserveSeat</code> or <code>acceptOffer</code>. That's the same shape as the REST calls, so each control really passes through Loading → Success / Error.</p></div>
+      <div class="card note" id="fe-honest" style="border-color: var(--amber)"><h3 style="color: var(--amber)">Honest note</h3><p>The web demo runs on an in-browser dispatch model (<code>sim/world.ts</code>). It ports the backend's rules: same pickup zone, 140% detour cap, first rider needs the driver, later riders auto-join. The real backend is tested end-to-end by a script that plays the same Banani story.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- 4 · Database -->
+<section class="slide" id="s4">
+  <div class="kicker">Part 2 · Engineering <span class="n">04 / 09</span></div>
+  <h1>Database: one DB per service; <em>trip.db</em> is the heart</h1>
+  <div class="erd">
+    <div class="card tbl trip" id="t-pools"><div class="th">pools <small>one trip of one vehicle</small></div><ul>
+      <li class="key">id <i>PK</i></li><li>driver_id · vehicle_id</li><li>max_capacity <i>1 … 6</i></li><li>occupied_seats <i>CHECK ≤ max_capacity</i></li><li>status <i>FORMING | IN_PROGRESS | …</i></li><li>pickup_zone · version</li></ul></div>
+    <div class="card tbl trip" id="t-rides"><div class="th">ride_requests <small>one passenger's booking</small></div><ul>
+      <li class="key">id <i>PK</i></li><li>pool_id <i>FK → pools (N : 1)</i></li><li>passenger_id · seats</li><li>pickup_zone · dropoff_zone</li><li>status <i>REQUESTED … COMPLETED</i></li><li>estimated / final_fare_poysha <i>INTEGER</i></li></ul></div>
+    <div class="card tbl" id="t-wp"><div class="th">pool_waypoints <small>planned stop order</small></div><ul>
+      <li>pool_id · ride_request_id · seq</li><li>kind · zone · done_at <i>PICKUP | DROPOFF</i></li></ul></div>
+    <div class="card tbl" id="t-hist"><div class="th">ride_status_history <small>audit trail</small></div><ul>
+      <li>ride_id · from_status → to_status</li><li>actor <i>PASSENGER | DRIVER | SYSTEM</i></li></ul></div>
+  </div>
+  <div class="grid3">
+    <div class="card mini"><h4>identity.db</h4><p>users · drivers · vehicles (<code>seat_capacity</code>)</p></div>
+    <div class="card mini"><h4>fare.db</h4><p>quotes · fares · wallets. Money is <b>integer poysha</b>: ৳93.50 is stored as 9350.</p></div>
+    <div class="card mini"><h4>Across services</h4><p>Linked by id only; no cross-DB joins. <code>outbox</code> + <code>processed_events</code> keep them consistent.</p></div>
+  </div>
+</section>
+
+<!-- 5 · Auth & APIs -->
+<section class="slide" id="s5">
+  <div class="kicker">Part 2 · Engineering <span class="n">05 / 09</span></div>
+  <h1>Users, auth and the <em>APIs</em> behind each button</h1>
+  <div class="row">
+    <div class="col" style="flex: 0 0 470px">
+      <div class="card note"><h3>Two roles</h3><p><span class="chip amber">DRIVER</span> Jashim, who owns the vehicle Bullet (3 seats).<br><br><span class="chip mint">PASSENGER</span> Nusrat, Rafiq and Shirin.</p></div>
+      <div class="card note"><h3>Authentication</h3><p>Identity signs <b>RS256 JWTs</b>. The gateway verifies every request and forwards the user id and role. Logout goes to a denylist in Redis. <code>POST /rides</code> <b>requires an idempotency key</b>, so a retried tap can't book twice.</p></div>
+    </div>
+    <div class="col" style="flex: 1">
+<pre class="code" id="api"><span class="c"># passenger</span>
+<span class="k">POST</span> /api/v1/auth/login          <span class="c">→ JWT</span>
+<span class="k">POST</span> /api/v1/fares/estimate      <span class="c">solo + pooled quote</span>
+<span class="k">POST</span> /api/v1/rides               <span class="g">request a ride / join a pool</span>
+<span class="k">POST</span> /api/v1/rides/{id}/cancel
+<span class="c"># driver</span>
+<span class="k">POST</span> /api/v1/drivers/me/online
+<span class="k">GET </span> /api/v1/driver/offers
+<span class="k">POST</span> /api/v1/driver/offers/{id}/accept   <span class="g">→ pool opens</span>
+<span class="k">POST</span> /api/v1/driver/rides/{id}/arrive
+<span class="k">POST</span> /api/v1/driver/rides/{id}/start
+<span class="k">POST</span> /api/v1/driver/rides/{id}/complete
+<span class="k">GET </span> /api/v1/driver/pool          <span class="c">riders, seats, stops</span>
+<span class="c"># live</span>
+<span class="k">WS  </span> /ws                          <span class="c">status pushes</span></pre>
+    </div>
+  </div>
+</section>
+
+<!-- 6 · Pool lifecycle -->
+<section class="slide" id="s6">
+  <div class="kicker">Part 2 · Engineering <span class="n">06 / 09</span></div>
+  <h1>The pool lifecycle, <em>step by step</em></h1>
+  <div class="timeline" id="tl">
+    <div class="tl"><span class="n">01</span><b>Create pool</b><p>Jashim accepts the first request (15 s offer)</p><div class="db">INSERT pools · FORMING</div></div>
+    <div class="tl"><span class="n">02</span><b>Available</b><p>A FORMING pool with free seats is open to riders</p><div class="db">status = FORMING</div></div>
+    <div class="tl"><span class="n">03</span><b>Discovered</b><p>Same pickup zone, within 140% detour for every rider</p><div class="db">planner.py</div></div>
+    <div class="tl"><span class="n">04</span><b>Passenger joins</b><p>Later compatible riders join automatically</p><div class="db">ride → MATCHED</div></div>
+    <div class="tl"><span class="n">05</span><b>Seats decrease</b><p>Pool discount applies once there are 2+ riders</p><div class="db">occupied_seats + n</div></div>
+    <div class="tl"><span class="n">06</span><b>Capacity / departs</b><p>Full at 3 / 3. First boarding closes it to new riders.</p><div class="db">IN_PROGRESS</div></div>
+    <div class="tl"><span class="n">07</span><b>Completes</b><p>Last drop-off settles the fares</p><div class="db">COMPLETED</div></div>
+  </div>
+  <div class="states" id="states">
+    <div class="st a">REQUESTED</div><div class="arr">driver / system</div>
+    <div class="st m">MATCHED</div><div class="arr">driver</div>
+    <div class="st m">DRIVER_ARRIVED</div><div class="arr">driver</div>
+    <div class="st b">STARTED</div><div class="arr">driver</div>
+    <div class="st">COMPLETED</div>
+  </div>
+  <div class="row">
+    <div style="flex: 0 0 720px">
+      <div class="file">services/trip/app/state_machine.py</div>
+<pre class="code" style="font-size:17px"><span class="f">TRANSITIONS</span> = {
+  (<span class="s">"REQUESTED"</span>, <span class="s">"MATCHED"</span>):        {<span class="s">"SYSTEM"</span>, <span class="s">"DRIVER"</span>},
+  (<span class="s">"REQUESTED"</span>, <span class="s">"CANCELLED"</span>):      {<span class="s">"PASSENGER"</span>, <span class="s">"SYSTEM"</span>},
+  (<span class="s">"MATCHED"</span>, <span class="s">"CANCELLED"</span>):        {<span class="s">"PASSENGER"</span>, <span class="s">"DRIVER"</span>},
+  <span class="mark">(<span class="s">"DRIVER_ARRIVED"</span>, <span class="s">"CANCELLED"</span>): {<span class="s">"DRIVER"</span>}</span>,  <span class="c"># no-show</span>
+  (<span class="s">"STARTED"</span>, <span class="s">"COMPLETED"</span>):        {<span class="s">"DRIVER"</span>}, …
+}</pre>
+    </div>
+    <div class="col" style="flex: 1; justify-content: center">
+      <div class="card note"><h3>Who may move a ride</h3><p>Each transition lists the actors allowed to make it. Anything else gets <code>409 INVALID_TRANSITION</code>. Every change is also written to <code>ride_status_history</code>.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- 7 · Key decision -->
+<section class="slide" id="s7">
+  <div class="kicker">Part 2 · Engineering <span class="n">07 / 09</span></div>
+  <h1>Key decision: the database <em>refuses</em> to oversell</h1>
+  <div class="row">
+    <div style="flex: 0 0 800px" class="col">
+      <div class="file">services/trip/app/pooling.py · try_join()</div>
+<pre class="code" id="code-join"><span class="k">async with</span> rw.begin() <span class="k">as</span> s:        <span class="c"># BEGIN IMMEDIATE: write lock</span>
+    res = <span class="k">await</span> s.execute(
+        update(Pool).where(
+            Pool.id == opt[<span class="s">"pool_id"</span>],
+            Pool.status == <span class="s">"FORMING"</span>,
+            <span class="mark">Pool.version == opt[<span class="s">"version"</span>]</span>,
+            <span class="mark">Pool.occupied_seats + seats &lt;= Pool.max_capacity</span>,
+        ).values(occupied_seats=Pool.occupied_seats + seats,
+                 version=Pool.version + 1))
+    <span class="k">if</span> res.rowcount != 1:
+        <span class="k">continue</span>                  <span class="c"># lost the race: try next / queue</span></pre>
+      <div class="file">services/trip/app/models.py</div>
+<pre class="code" style="font-size:17px">CheckConstraint(<span class="s">"occupied_seats &gt;= 0 AND occupied_seats &lt;= max_capacity"</span>,
+                name=<span class="s">"<span class="g">ck_pool_capacity</span>"</span>)   <span class="c"># backstop</span></pre>
+    </div>
+    <div class="col" style="flex: 1">
+      <div class="card note"><h3>Why not "read, then write"?</h3><p>Two requests could both read "1 seat left" and both write. Here the check and the increment happen in <b>one conditional UPDATE</b>.</p></div>
+      <div class="race" id="race">
+        <div class="lane win"><h4>Claim A lands first</h4><p>rowcount = 1<br>seats 2 → 3 · v7 → v8</p></div>
+        <div class="lane lose"><h4>Claim B (+340 ms)</h4><p>rowcount = 0<br>"seat taken" → re-queued</p></div>
+      </div>
+      <div class="card note"><p>Proven in <code>tests/test_concurrency.py</code>: parallel joins, and exactly one writer wins.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- 8 · Trade-off -->
+<section class="slide" id="s8">
+  <div class="kicker">Part 2 · Engineering <span class="n">08 / 09</span></div>
+  <h1>The trade-off: <em>SQLite</em>, one file per service</h1>
+  <div class="quote">We chose <b>SQLite with a single writer per service</b> because it makes the seat check <b>simple and race-free</b>, with no lock server and no extra infrastructure. The trade-off: <b>each service runs as one container</b>, so it can't scale out horizontally.</div>
+  <div class="scale">
+    <div class="card pro"><h3><span class="chip mint">Gains</span></h3><ul>
+      <li>Writes are serialised (<code>BEGIN IMMEDIATE</code>), so the compare-and-set UPDATE is enough.</li>
+      <li>Zero-ops: <code>docker compose up</code> runs all six services with WAL-mode files.</li>
+      <li>The CHECK constraint still guards the data if code ever goes wrong.</li></ul></div>
+    <div class="card con"><h3><span class="chip amber">Costs</span></h3><ul>
+      <li>One writer per DB file: no second replica of Trip.</li>
+      <li>Write throughput tops out at one machine.</li>
+      <li>Path to scale: Postgres per service. The same conditional UPDATE works there under row locks.</li></ul></div>
+  </div>
+</section>
+
+<!-- 9 · Bridge to demo -->
+<section class="slide" id="s9">
+  <div class="kicker">Part 3 · Live scenario <span class="n">09 / 09</span></div>
+  <h1>Now watch it happen: <em>one Tesla, four people</em></h1>
+  <div class="grid3" style="grid-template-columns: repeat(4, 1fr)">
+    <div class="card mini" style="border-color: var(--amber)"><h4><span class="chip amber">Driver</span></h4><p><b style="color:var(--fg);font-size:24px">Jashim</b><br>Drives Bullet (3 seats). He accepts the first rider, which opens the pool.</p></div>
+    <div class="card mini" style="border-color: var(--mint)"><h4><span class="chip mint">Passenger</span></h4><p><b style="color:var(--fg);font-size:24px">Nusrat</b><br>Banani → Mohakhali. The first rider, who needs Jashim to accept.</p></div>
+    <div class="card mini" style="border-color: var(--mint)"><h4><span class="chip mint">Passenger</span></h4><p><b style="color:var(--fg);font-size:24px">Rafiq</b><br>Banani → Gulshan 1. Auto-joins the same pool.</p></div>
+    <div class="card mini" style="border-color: var(--coral)"><h4><span class="chip coral">Last seat</span></h4><p><b style="color:var(--fg);font-size:24px">Shirin</b><br>Banani → Gulshan 2. Races for seat 3.</p></div>
+  </div>
+</section>
+
+<script>
+  const slides = [...document.querySelectorAll('.slide')];
+  window.go = (i) => slides.forEach((s, k) => s.classList.toggle('on', k === i));
+  window.hl = (sel, on = true) => document.querySelectorAll(sel).forEach((e) => e.classList.toggle('hl', on));
+  go(Number(location.hash.slice(1) || 0));
+</script>
+</body>
+</html>

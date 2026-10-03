@@ -1,0 +1,143 @@
+1
+00:00:00,326 --> 00:00:09,013
+Tesla-Lagbo, or Dhaka Tesla Pool, is a ride-pooling platform for small three-seat electric Teslas.
+
+2
+00:00:09,627 --> 00:00:21,377
+On a corridor like Banani to Mohakhali, a three-seat Tesla often drives with one rider. Seats are wasted, fares stay high, and the next rider waits for another car.
+
+3
+00:00:21,387 --> 00:00:33,131
+Tesla-Lagbo fills those seats. Riders leaving from the same zone, whose drop-offs fit on one route, share one Tesla. Each pays for their own trip, with a pool discount.
+
+4
+00:00:33,142 --> 00:00:42,304
+There are two kinds of user. Passengers, like Nusrat and Rafiq, who share this corridor, and Shirin, who wants the final seat.
+
+5
+00:00:42,314 --> 00:00:50,363
+And drivers, like Jashim, who drives Bullet. His cockpit shows the riders, the seats, and one clear next step.
+
+6
+00:00:50,363 --> 00:00:58,771
+The platform manages drivers, riders, seats and the whole ride lifecycle, and it must never sell the same seat twice.
+
+7
+00:01:00,071 --> 00:01:11,821
+Every tap follows one path: the Next.js frontend calls the API gateway, the Trip service writes the database, and an event pushes the new state to passenger and driver.
+
+8
+00:01:11,846 --> 00:01:23,958
+The backend is six FastAPI services, one job each, behind a gateway. HTTP when an answer is needed now, RabbitMQ events for facts like "ride completed", Redis for fast-moving data.
+
+9
+00:01:23,969 --> 00:01:34,973
+The frontend is Next.js and TypeScript. Every screen derives from one lifecycle status. The live demo runs on an in-browser model that applies the backend's pooling rules.
+
+10
+00:01:34,994 --> 00:01:48,591
+Each service owns its database. In trip.db, a pool is one trip of one vehicle, with a capacity and an occupied-seat count. Ride requests belong to a pool, and each status change is audited.
+
+11
+00:01:48,603 --> 00:02:00,348
+Identity issues signed JWTs and the gateway checks every call. Each button maps to one endpoint, and booking needs an idempotency key, so a retried tap can't book twice.
+
+12
+00:02:00,359 --> 00:02:16,545
+A pool is created when a driver accepts the first request. Compatible riders join and seats fill up. The first boarding closes it to new riders, and the last drop-off completes it. A transition table decides who may move a ride.
+
+13
+00:02:16,565 --> 00:02:29,427
+The key decision: how to stop overbooking. There's no read-then-write. One conditional UPDATE succeeds only if the seats still fit and the pool version is unchanged. A CHECK constraint backs it up.
+
+14
+00:02:29,441 --> 00:02:44,403
+We chose SQLite with one writer per service because it makes that seat check simple and race-free. The trade-off: a service can't scale out past one container. Postgres per service is the path to scale.
+
+15
+00:02:44,410 --> 00:02:50,724
+Now let's watch one Tesla and four people move through the real app.
+
+16
+00:02:51,253 --> 00:02:58,178
+We reset the demo to an empty Bullet: Jashim is online at Banani, with no riders.
+
+17
+00:02:58,182 --> 00:03:07,330
+Jashim's cockpit: online, battery at 78 percent, zero of three seats taken. There's no pool yet. His first accepted rider creates it.
+
+18
+00:03:07,335 --> 00:03:17,477
+Nusrat opens the app. She picks Banani to Mohakhali from Dhaka's zones, and a solo estimate appears right away.
+
+19
+00:03:17,477 --> 00:03:22,793
+She reserves seat 1. It's held for her while Jashim decides: status Requested.
+
+20
+00:03:22,803 --> 00:03:30,112
+Jashim gets a 15-second offer with Nusrat's route and fare. He accepts, and that creates the pool.
+
+21
+00:03:30,112 --> 00:03:38,903
+The pool is forming. Nusrat is in seat 1, and his stop list starts with her pickup at Banani Road 11.
+
+22
+00:03:38,903 --> 00:03:44,717
+On Nusrat's phone: matched with Jashim, Bullet's plate, and a live pickup countdown.
+
+23
+00:03:44,732 --> 00:03:57,582
+Rafiq wants Banani to Gulshan 1. He sees the same Tesla, now one of three seats taken, and the app checks his stop keeps every rider within the 140 percent detour cap.
+
+24
+00:03:57,582 --> 00:04:06,362
+He reserves seat 2 and joins instantly: later riders don't need the driver's approval. The pool discount applies to his fare.
+
+25
+00:04:06,362 --> 00:04:18,849
+Back in Jashim's cockpit: two passengers share one Tesla, two of three seats. The planner has ordered the stops: both pickups, then Rafiq's drop at Gulshan 1, then Nusrat's at Mohakhali.
+
+26
+00:04:18,858 --> 00:04:24,723
+Now Shirin, going to Gulshan 2. Exactly one seat is left: seat 3.
+
+27
+00:04:24,731 --> 00:04:34,249
+To show the edge case, we fire a competing claim for the same seat at the same moment, like two phones tapping together.
+
+28
+00:04:34,249 --> 00:04:44,140
+Shirin taps Reserve. The other claim reaches the server 340 milliseconds earlier. Her request is refused cleanly, and seat 3 is never sold twice.
+
+29
+00:04:44,140 --> 00:04:56,258
+No crash and no overbooking. The cabin now shows three of three, a banner explains what happened, her route is kept, and she's queued for the next pooled Tesla automatically.
+
+30
+00:04:56,258 --> 00:05:02,082
+Jashim's manifest agrees: three of three seats, and nobody else can get in.
+
+31
+00:05:02,088 --> 00:05:14,954
+The ride begins. Jashim confirms arrival, then slides to board each passenger, so a bump in traffic can't start a trip by accident. The first boarding closes the pool to new riders.
+
+32
+00:05:14,954 --> 00:05:23,735
+He drops Rafiq at Gulshan 1, then Nusrat at Mohakhali. Each drop-off settles that fare into his ledger, in integer poysha.
+
+33
+00:05:23,735 --> 00:05:32,884
+The pool closes and the seats free up. Shirin's queued request goes straight to Jashim as the next offer, and he accepts.
+
+34
+00:05:32,884 --> 00:05:39,822
+Jashim's trip history keeps the finished pool: both riders, their routes and the fares he earned.
+
+35
+00:05:40,654 --> 00:05:54,908
+Jashim created the pool. Nusrat joined. Rafiq auto-joined. Shirin tried for the last seat: refused without overbooking, queued, and matched on the next trip.
+
+36
+00:05:54,913 --> 00:06:02,977
+That's Tesla-Lagbo: shared Tesla rides where every seat is sold exactly once. Thanks for watching!
